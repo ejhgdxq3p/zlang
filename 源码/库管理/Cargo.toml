@@ -1,0 +1,25 @@
+[package]
+name = "libmgr"
+version = "0.1.0"
+edition = "2021"
+description = "智语言库管理器：安装、卸载、更新、封装、发布"
+
+[lib]
+path = "src/库.rs"
+
+[dependencies]
+serde_json = "1"
+ureq = { version = "3", features = ["gzip"] }
+pm = { path = "../项目管理" }
+
+[dev-dependencies]
+# ★★ 2026-09-20 缺口修复（真实现缺陷；致「服务端对接门禁」库管理一项失败）★★
+#   `tests/集成.rs` 第 79 行调用 `base::平台::可执行文件名("node")`，但本包依赖里**没有 `base`**
+#   ⇒ 测试目标编译直接失败：
+#       error[E0433]: cannot find module or crate `base` in this scope
+#       error: could not compile `libmgr` (test "集成") due to 1 previous error
+#   `base` 是 `源码/基础功能` 的**库名**（其 [package].name = "basic_functions"，
+#   而 [lib].name = "base"）—— `pm` 正是用 `basic_functions = { path = "../基础功能" }`
+#   引入后以 `base::…` 引用（见 `项目管理/Cargo.toml` 第 11 行）。
+#   ⇒ 本处补齐同一依赖；仅集成测试使用，故置于 `[dev-dependencies]`（最小作用域）。
+basic_functions = { path = "../基础功能" }

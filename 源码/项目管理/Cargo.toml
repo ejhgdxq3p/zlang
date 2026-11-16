@@ -1,0 +1,11 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2021"
+description = "智语言工程管理统一层：全局目录、全局配置、项目/依赖解析、产物路径（双模式共享真相源）"
+
+[lib]
+path = "src/库.rs"
+
+[dependencies]
+basic_functions = { path = "../基础功能" }

@@ -1,0 +1,17 @@
+[package]
+name = "interpreter"
+version = "0.1.0"
+edition = "2021"
+description = "智语言解释器后端：字节码生成、栈式虚拟机、调试器"
+
+[lib]
+path = "src/库.rs"
+
+[dependencies]
+frontend = { path = "../../前端" }
+basic_functions = { path = "../../基础功能" }
+pm = { path = "../../项目管理" }
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+csv = "1"

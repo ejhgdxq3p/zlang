@@ -1,0 +1,18 @@
+[package]
+name = "compiler"
+version = "0.1.0"
+edition = "2021"
+description = "智语言编译器后端：Cranelift 代码生成、优化管线、链接"
+
+[lib]
+path = "src/库.rs"
+
+[dependencies]
+frontend = { path = "../../前端" }
+basic_functions = { path = "../../基础功能" }
+cranelift-codegen = "0.110"
+cranelift-frontend = "0.110"
+cranelift-module = "0.110"
+cranelift-object = "0.110"
+cranelift-native = "0.110"
+target-lexicon = "0.12"

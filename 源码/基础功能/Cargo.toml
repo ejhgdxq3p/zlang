@@ -1,0 +1,27 @@
+[package]
+name = "basic_functions"
+version = "0.1.0"
+edition = "2021"
+description = "智语言基础功能：运行时引擎、核心库、标准库的原生实现与系统函数分发 — 双模式共享的真相来源"
+
+[lib]
+name = "base"
+crate-type = ["staticlib", "rlib"]
+path = "src/库.rs"
+
+[dependencies]
+lazy_static = "1"
+once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+serde_json = "1"
+csv = "1"
+http = "1"
+ureq = { version = "3", features = ["cookies"] }
+ascii = "1"
+chunked_transfer = "1"
+httpdate = "1.0.2"
+log = "0.4.4"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+crossbeam = "0.8"

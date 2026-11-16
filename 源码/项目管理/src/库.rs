@@ -1,0 +1,29 @@
+// 文件: 工程管理/src/库.rs
+// 职责: 工程管理统一层入口
+// 双模式复用说明：解释模式（虚拟机/模块加载器）与编译模式（代码生成）都经本 crate
+// 获取全局目录、全局配置、产物路径与模块解析方案，保证导入解析语义跨模式一致。
+
+#[path = "目录.rs"]
+pub mod 目录;
+#[path = "全局配置.rs"]
+pub mod 全局配置;
+#[path = "产物路径.rs"]
+pub mod 产物路径;
+#[path = "依赖解析.rs"]
+pub mod 依赖解析;
+#[path = "项目检测.rs"]
+pub mod 项目检测;
+#[path = "创建项目.rs"]
+pub mod 创建项目;
+#[path = "清理.rs"]
+pub mod 清理;
+#[path = "项目源文件.rs"]
+pub mod 项目源文件;
+#[path = "配置读取器.rs"]
+pub mod 配置读取器;
+#[path = "网址规范化.rs"]
+pub mod 网址规范化;
+#[path = "命名规范.rs"]
+pub mod 命名规范;
+#[path = "版本号.rs"]
+pub mod 版本号;

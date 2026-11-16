@@ -1,0 +1,11 @@
+[build]
+# target-dir 使用相对路径，相对 .cargo 配置所在目录（即项目根）解析为 <项目根>/产出。
+# 目的：使「智语言」项目整体可随文件夹任意挪移，不绑定本机绝对路径。
+# 说明：cargo 对 config 内相对 target-dir 按「配置目录」解析（非 cwd），故恒为 <项目根>/产出；
+# 若改用 CARGO_TARGET_DIR 环境变量或在子 crate 内独立构建，则按 cwd 解析，须保证 cwd 为项目根
+# （本项目统一在根目录执行 cargo build --bin 智语言开发套件，故相对路径安全）。
+target-dir = "产出"
+
+# 依赖源保持 cargo 默认（crates.io）：用户克隆后 `cargo build` 自动联网拉取，无需任何路径配置。
+# 如需加速，请在自己机器的全局 ~/.cargo/config.toml 配置国内镜像，勿写入本仓库。
+# （历史上曾用 [source.vendored] 指向本机绝对路径做离线构建，该写法绑死用户名与操作系统，已移除，不可恢复。）

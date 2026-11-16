@@ -1,0 +1,12 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2021"
+description = "智语言统一前端：词法、语法、语义分析及高层表示/底层表示"
+
+[lib]
+path = "src/库.rs"
+
+[dependencies]
+pm = { path = "../项目管理" }
+basic_functions = { path = "../基础功能" }
