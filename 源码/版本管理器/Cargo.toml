@@ -5,6 +5,7 @@ name = "launcher"
 # 换版本只改这一处（命令行入口 版本 命令、产出发布 打包 自动跟随）。
 version = "0.0.1"
 edition = "2021"
+license.workspace = true
 description = "智语言引导程序 — 统一入口、版本匹配、命令转发、环境管理（规范 6.1.3）"
 
 # 版本管理器：统一入口、版本匹配、命令转发

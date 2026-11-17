@@ -2,6 +2,7 @@
 name = "compiler"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "智语言编译器后端：Cranelift 代码生成、优化管线、链接"
 
 [lib]

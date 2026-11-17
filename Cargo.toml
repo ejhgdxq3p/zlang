@@ -1,4 +1,5 @@
 [workspace]
+# 双许可：使用者可任选 MIT 或 Apache-2.0（见 LICENSE-MIT / LICENSE-APACHE）
 members = ["源码/前端","源码/基础功能","源码/后端/解释器","源码/后端/编译器","源码/库管理","源码/编辑器服务","源码/项目管理","源码/版本管理器","源码/模拟服务器"]
 default-members = ["源码/基础功能","源码/前端","源码/后端/解释器","源码/后端/编译器","源码/版本管理器"]
 resolver = "2"
@@ -8,3 +9,6 @@ resolver = "2"
 # 「thread has overflowed its stack」。O1 保留调试信息与断言，仅优化栈帧/临时值布局。
 [profile.dev]
 opt-level = 1
+
+[workspace.package]
+license = "MIT OR Apache-2.0"

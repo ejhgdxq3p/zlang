@@ -802,39 +802,39 @@ fn 预扫描入口(_根路径: &Path, 源文件列表: &[String]) -> Vec<(String
 /// 中文路径根治铁律（2026-08-05 定稿）：MinGW 的 gcc/ar 是 GNU 第三方程序，
 /// 链老 MSVCRT 把 UTF-8 中文路径按 GBK(936) 解码会乱码「找不到文件」，**绝对禁止调用 gcc/cc**。
 /// 探测顺序：
-///   1. 开发套件随包自带工具链：exe 所在目录的 上级/工具链/clang(.exe)（安装环境
-///      `安装路径/版本X/执行文件/智语言开发套件(.exe)` → `安装路径/版本X/工具链/clang(.exe)`）；
-///   2. 开发仓库工具链：仓库根 文件/工具链/精简工具链/bin/clang(.exe)（开发环境调试用）；
+///   1. 开发套件随包自带精简编译器：exe 所在目录的 上级/精简编译器/bin/clang(.exe)（安装环境
+///      `安装路径/版本X/执行文件/智语言开发套件(.exe)` → `安装路径/版本X/精简编译器/bin/clang(.exe)`）；
+///   2. 开发仓库工具链：仓库根 文件/外部语言编译器/精简编译器/bin/clang(.exe)（开发环境调试用）；
 ///   3. 用户 PATH 中的 clang（需用户自装 LLVM，UTF-8 原生友好）。
 ///   工具链名跨平台由 基础功能::平台 统一提供（POSIX=clang / Windows=clang.exe）。
 /// 任一命中返回其绝对路径；都不存在返回 None（调用方必须明确报错，绝不静默跳过）。
 fn 查找外部语言编译器() -> Option<PathBuf> {
     // 跨平台工具链名：Windows clang.exe，POSIX clang（随包工具链 / PATH 兜底均用此名）
     let 工具链名 = base::平台::可执行文件名("clang");
-    // 1. 开发套件随包自带工具链：exe 的 上级/工具链/
+    // 1. 开发套件随包自带精简编译器：exe 的 上级/精简编译器/bin/
     if let Ok(当前exe) = std::env::current_exe() {
         if let Some(目录) = 当前exe.parent().and_then(|p| p.parent()) {
-            let 候选 = 目录.join("工具链").join(&工具链名);
+            let 候选 = 目录.join("精简编译器").join("bin").join(&工具链名);
             if 候选.exists() {
                 return Some(候选);
             }
         }
-        // 1b. exe 同级的 工具链/（便携版单层布局）
+        // 1b. exe 同级的 精简编译器/bin/（便携版单层布局）
         if let Some(目录) = 当前exe.parent() {
-            let 候选 = 目录.join("工具链").join(&工具链名);
+            let 候选 = 目录.join("精简编译器").join("bin").join(&工具链名);
             if 候选.exists() {
                 return Some(候选);
             }
         }
     }
-    // 2. 开发仓库工具链（仓库根/文件/工具链/精简工具链/bin/clang.exe）
+    // 2. 开发仓库工具链（仓库根/文件/外部语言编译器/精简编译器/bin/clang.exe）
     //    开发环境 exe 位于 仓库根/产出/debug/，需向上 3 层（debug→产出→仓库根）到仓库根。
     //    用「向上找含 Cargo.toml 的目录」判定仓库根，更健壮（不依赖固定层级）。
     if let Ok(当前exe) = std::env::current_exe() {
         let mut 目录 = 当前exe.parent();
         while let Some(d) = 目录 {
             if d.join("Cargo.toml").exists() {
-                let 候选 = d.join(format!("文件/工具链/精简工具链/bin/{}", 工具链名));
+                let 候选 = d.join(format!("文件/外部语言编译器/精简编译器/bin/{}", 工具链名));
                 if 候选.exists() {
                     return Some(候选);
                 }
@@ -844,7 +844,7 @@ fn 查找外部语言编译器() -> Option<PathBuf> {
         }
     }
     // 2b. 相对当前目录的仓库布局（回退，兼容从仓库根运行的场景）
-    let 相对候选 = PathBuf::from(format!("文件/工具链/精简工具链/bin/{}", 工具链名));
+    let 相对候选 = PathBuf::from(format!("文件/外部语言编译器/精简编译器/bin/{}", 工具链名));
     if 相对候选.exists() {
         return Some(相对候选);
     }

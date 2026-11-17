@@ -2,6 +2,7 @@
 name = "mock_server"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "智语言网络测试 HTTP 模拟服务器（纯 std 实现，零额外依赖）"
 
 [[bin]]

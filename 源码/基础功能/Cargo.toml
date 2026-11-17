@@ -2,6 +2,7 @@
 name = "basic_functions"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "智语言基础功能：运行时引擎、核心库、标准库的原生实现与系统函数分发 — 双模式共享的真相来源"
 
 [lib]

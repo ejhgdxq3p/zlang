@@ -2,6 +2,7 @@
 name = "editor_service"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [[bin]]
 name = "智语言-编辑器服务"

@@ -2,6 +2,7 @@
 name = "libmgr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "智语言库管理器：安装、卸载、更新、封装、发布"
 
 [lib]
