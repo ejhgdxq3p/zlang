@@ -955,16 +955,24 @@ pub fn 从外部值还原(v: 运行时值) -> 运行时值 {
     if 指针.is_null() {
         return 运行时值::空值();
     }
+    // 缓冲来自外部代码（shim / 用户写的原生库），头部里的长度与元素个数都不可信：
+    // 旧实现直接按它们切片、预分配、循环读取，个数被写坏时会越界读或因容量溢出直接中止进程。
+    // 现在逐项校验「头部 + 个数 × 每项字节 ≤ 总长」，不满足一律按损坏处理并还原为空值。
     let 子标签 = 读u64(指针, 0);
+    let 总长 = 读u64(指针, 8) as usize;
+    if 总长 < 16 {
+        return 运行时值::空值();
+    }
     match 子标签 {
         线_文本 => {
-            let 总长 = 读u64(指针, 8) as usize;
             let 文本字节 = unsafe { std::slice::from_raw_parts(指针.add(16), 总长 - 16) };
             let s = String::from_utf8_lossy(文本字节).to_string();
             分配文本(s)
         }
         线_数组 => {
+            if 总长 < 24 { return 运行时值::空值(); }
             let 数量 = 读u64(指针, 16) as usize;
+            if !容器数量合法(总长, 24, 数量, 32) { return 运行时值::空值(); }
             let mut 偏移 = 24usize;
             let mut 元素 = Vec::with_capacity(数量);
             for _ in 0..数量 {
@@ -975,7 +983,9 @@ pub fn 从外部值还原(v: 运行时值) -> 运行时值 {
             分配数组(元素)
         }
         线_映射 => {
+            if 总长 < 24 { return 运行时值::空值(); }
             let 数量 = 读u64(指针, 16) as usize;
+            if !容器数量合法(总长, 24, 数量, 64) { return 运行时值::空值(); }
             let mut 偏移 = 24usize;
             let mut 项 = Vec::with_capacity(数量);
             for _ in 0..数量 {
@@ -990,8 +1000,10 @@ pub fn 从外部值还原(v: 运行时值) -> 运行时值 {
             分配映射(项)
         }
         线_结构体 => {
+            if 总长 < 32 { return 运行时值::空值(); }
             let 类型索引 = 读u64(指针, 16) as usize;
             let 数量 = 读u64(指针, 24) as usize;
+            if !容器数量合法(总长, 32, 数量, 32) { return 运行时值::空值(); }
             let mut 偏移 = 32usize;
             let mut 字段 = Vec::with_capacity(数量);
             for _ in 0..数量 {
@@ -1002,8 +1014,10 @@ pub fn 从外部值还原(v: 运行时值) -> 运行时值 {
             分配结构体(类型索引, 字段)
         }
         线_闭包 => {
+            if 总长 < 32 { return 运行时值::空值(); }
             let 函数索引 = 读u64(指针, 16) as usize;
             let 数量 = 读u64(指针, 24) as usize;
+            if !容器数量合法(总长, 32, 数量, 32) { return 运行时值::空值(); }
             let mut 偏移 = 32usize;
             let mut 捕获 = Vec::with_capacity(数量);
             for _ in 0..数量 {
@@ -1017,20 +1031,20 @@ pub fn 从外部值还原(v: 运行时值) -> 运行时值 {
     }
 }
 
+/// 容器缓冲的元素个数是否与总长相容：头部字节 + 个数 × 每项字节 ≤ 总长（含溢出检查）。
+fn 容器数量合法(总长: usize, 头部字节: usize, 数量: usize, 每项字节: usize) -> bool {
+    数量.checked_mul(每项字节)
+        .and_then(|n| n.checked_add(头部字节))
+        .map(|n| n <= 总长)
+        .unwrap_or(false)
+}
+
 /// 运行时值（还原后）→ 堆键：文本来自 标签_句柄(文本) 或 标签_外部值(文本)。
 fn 运行时值到堆键(v: 运行时值) -> 堆键 {
-    if v.标签 == 标签_句柄 {
-        if let Some(s) = 堆读取文本字符串(v.句柄) {
-            return 堆键::文本(s);
-        }
-    }
-    if v.标签 == 标签_整数 {
-        return 堆键::整数(v.整数);
-    }
-    if v.标签 == 标签_逻辑 {
-        return 堆键::逻辑(v.整数 != 0);
-    }
-    堆键::整数(0)
+    // 与 堆键到运行时值 对称：统一走 值转键（整数/逻辑/空值/小数/文本/结构体/枚举）。
+    // 旧实现只认文本、整数、逻辑，其余一律落到 整数键 0：小数键、空值键的映射
+    // 经外部调用往返后所有这类键都塌缩成同一个键 0，条目互相覆盖。
+    值转键(&v).unwrap_or(堆键::整数(0))
 }
 
 // ── 释放：递归回收扁平缓冲 ──
@@ -1044,6 +1058,10 @@ pub fn 释放外部值(v: 运行时值) {
         return;
     }
     let 总长 = 读u64(指针, 8) as usize;
+    // 头部损坏（总长不足一个头部）：无法得知原始分配大小，宁可泄漏也不按错误大小释放
+    if 总长 < 16 {
+        return;
+    }
     let 子标签 = 读u64(指针, 0);
     释放嵌套(子标签, 指针, 总长);
     unsafe {
@@ -1052,10 +1070,12 @@ pub fn 释放外部值(v: 运行时值) {
 }
 
 /// 递归释放 payload 中嵌套的 标签_外部值 缓冲。
-fn 释放嵌套(子标签: u64, 指针: *mut u8, _总长: usize) {
+fn 释放嵌套(子标签: u64, 指针: *mut u8, 总长: usize) {
     match 子标签 {
         线_数组 => {
+            if 总长 < 24 { return; }
             let 数量 = 读u64(指针, 16) as usize;
+            if !容器数量合法(总长, 24, 数量, 32) { return; }
             let mut 偏移 = 24usize;
             for _ in 0..数量 {
                 let (rv, 步进) = 读运行时值(指针, 偏移);
@@ -1066,7 +1086,9 @@ fn 释放嵌套(子标签: u64, 指针: *mut u8, _总长: usize) {
             }
         }
         线_映射 => {
+            if 总长 < 24 { return; }
             let 数量 = 读u64(指针, 16) as usize;
+            if !容器数量合法(总长, 24, 数量, 64) { return; }
             let mut 偏移 = 24usize;
             for _ in 0..数量 {
                 let (k, s1) = 读运行时值(指针, 偏移);
@@ -1082,7 +1104,9 @@ fn 释放嵌套(子标签: u64, 指针: *mut u8, _总长: usize) {
             }
         }
         线_结构体 | 线_闭包 => {
+            if 总长 < 32 { return; }
             let 数量 = 读u64(指针, 24) as usize;
+            if !容器数量合法(总长, 32, 数量, 32) { return; }
             let mut 偏移 = 32usize;
             for _ in 0..数量 {
                 let (f, 步进) = 读运行时值(指针, 偏移);
@@ -1740,6 +1764,53 @@ mod 编组层测试 {
         } else {
             String::new()
         }
+    }
+
+    #[test]
+    fn 损坏的元素个数不越界() {
+        let 编组值 = 编组为外部值(分配数组(vec![运行时值::整数(1), 运行时值::整数(2)]));
+        let 指针 = 编组值.整数 as u64 as *mut u8;
+        // 把元素个数改成一个巨大的值：旧实现会按它预分配并越界读取
+        unsafe { std::ptr::write_unaligned(指针.add(16) as *mut u64, u64::MAX / 2) };
+        assert_eq!(从外部值还原(编组值).标签, 标签_空值);
+        // 个数只多 1 同样必须拒绝（刚好越过缓冲末尾）
+        unsafe { std::ptr::write_unaligned(指针.add(16) as *mut u64, 3) };
+        assert_eq!(从外部值还原(编组值).标签, 标签_空值);
+        // 恢复后正常还原并释放
+        unsafe { std::ptr::write_unaligned(指针.add(16) as *mut u64, 2) };
+        assert_eq!(从外部值还原(编组值).标签, 标签_句柄);
+        释放外部值(编组值);
+    }
+
+    #[test]
+    fn 损坏的总长不下溢() {
+        let 编组值 = 编组为外部值(分配文本("甲".to_string()));
+        let 指针 = 编组值.整数 as u64 as *mut u8;
+        let 原总长 = 读u64(指针, 8);
+        unsafe { std::ptr::write_unaligned(指针.add(8) as *mut u64, 8) };
+        assert_eq!(从外部值还原(编组值).标签, 标签_空值);
+        unsafe { std::ptr::write_unaligned(指针.add(8) as *mut u64, 原总长) };
+        释放外部值(编组值);
+    }
+
+    #[test]
+    fn 小数键与空值键往返不塌缩() {
+        let 映射值 = 分配映射(vec![
+            (堆键::小数(1.5f64.to_bits()), 运行时值::整数(1)),
+            (堆键::小数(2.5f64.to_bits()), 运行时值::整数(2)),
+            (堆键::空值, 运行时值::整数(3)),
+        ]);
+        let 编组值 = 编组为外部值(映射值);
+        let 还原 = 从外部值还原(编组值);
+        if let Some(堆数据::映射(m)) = 堆读取(还原.句柄) {
+            assert_eq!(m.len(), 3, "三个键不应互相覆盖");
+            assert!(m.iter().any(|(k, v)| matches!(k, 堆键::小数(位) if *位 == 1.5f64.to_bits()) && v.整数 == 1));
+            assert!(m.iter().any(|(k, v)| matches!(k, 堆键::小数(位) if *位 == 2.5f64.to_bits()) && v.整数 == 2));
+            assert!(m.iter().any(|(k, v)| matches!(k, 堆键::空值) && v.整数 == 3));
+        } else {
+            panic!("应为映射");
+        }
+        释放外部值(编组值);
     }
 
     #[test]

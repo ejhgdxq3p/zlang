@@ -566,6 +566,14 @@ impl FFI代码生成器 {
         代码.push_str(") -> u64 {\n");
         代码.push_str("    let 形状usize = 形状 as usize;\n");
         代码.push_str("    if 形状usize >= 5 { return 0; }\n");
+        // 同一个函数重复注册时复用它已有的槽位。槽位从不释放，旧实现每次带回调参数的外部调用
+        // 都新占一个槽：同一形状累计第 257 次调用起注册失败，C 侧拿到空函数指针后崩溃。
+        // 槽位只记录「函数索引」，同一函数对应同一 trampoline，复用对仍持有旧地址的 C 代码无影响。
+        代码.push_str("    for 槽位 in 0..256usize {\n");
+        代码.push_str("        if 回调槽位表[形状usize][槽位] == 函数索引 && 函数索引 != 0 {\n");
+        代码.push_str("            return 取回调地址(形状usize, 槽位);\n");
+        代码.push_str("        }\n");
+        代码.push_str("    }\n");
         代码.push_str("    for 槽位 in 0..256usize {\n");
         代码.push_str("        if 回调槽位表[形状usize][槽位] == 0 {\n");
         代码.push_str("            回调槽位表[形状usize][槽位] = 函数索引;\n");
@@ -1298,6 +1306,19 @@ impl FFI代码生成器 {
 #[cfg(test)]
 mod 测试 {
     use super::*;
+
+    /// 回调槽位按函数复用：同一函数重复注册必须先查已有槽位，再找空槽。
+    /// 设置环境变量 ZHI_DUMP_TEST_SHIM=<路径> 时把生成的源码写到该路径，便于单独用 rustc 编译后做行为验证。
+    #[test]
+    fn 生成shim_回调槽位按函数复用() {
+        let 代码 = FFI代码生成器::生成shim(&[], &[]);
+        let 复用 = 代码.find("回调槽位表[形状usize][槽位] == 函数索引 && 函数索引 != 0").expect("缺少按函数复用槽位的查找");
+        let 占用 = 代码.find("回调槽位表[形状usize][槽位] = 函数索引;").expect("缺少占用空槽");
+        assert!(复用 < 占用, "必须先查已有槽位再占用空槽");
+        if let Ok(路径) = std::env::var("ZHI_DUMP_TEST_SHIM") {
+            std::fs::write(路径, &代码).unwrap();
+        }
+    }
 
     #[test]
     fn 生成shim_导入() {
