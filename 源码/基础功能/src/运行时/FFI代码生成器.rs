@@ -515,7 +515,7 @@ impl FFI代码生成器 {
             代码.push_str(&format!("#[export_name = \"z_cb_3_{s}\"]\npub unsafe extern \"C\" fn z_cb_3_{s}(v: i64, p: *mut std::ffi::c_void) -> i64 {{\n", s=槽位));
             代码.push_str(&format!("    let 结果 = 回调内部调度(3, {s}, &[\n", s=槽位));
             代码.push_str("        运行时值::整数(v),\n");
-            代码.push_str("        运行时值 { 标签: 4, 整数: p as i64, 小数: 0.0, 句柄: 0 },\n");
+            代码.push_str("        运行时值::整数(p as i64),\n");
             代码.push_str("    ]);\n");
             代码.push_str("    结果.整数\n");
             代码.push_str("}\n");
@@ -525,7 +525,7 @@ impl FFI代码生成器 {
         for 槽位 in 0..256 {
             代码.push_str(&format!("#[export_name = \"z_cb_4_{s}\"]\npub unsafe extern \"C\" fn z_cb_4_{s}(p: *mut std::ffi::c_void) {{\n", s=槽位));
             代码.push_str(&format!("    let 结果 = 回调内部调度(4, {s}, &[\n", s=槽位));
-            代码.push_str("        运行时值 { 标签: 4, 整数: p as i64, 小数: 0.0, 句柄: 0 },\n");
+            代码.push_str("        运行时值::整数(p as i64),\n");
             代码.push_str("    ]);\n");
             代码.push_str("    let _ = 结果;\n");
             代码.push_str("}\n");
@@ -835,7 +835,8 @@ impl FFI代码生成器 {
             C类型::逻辑 =>
                 format!("运行时值 {{ 标签: 3, 整数: if ({} ) != 0 {{ 1 }} else {{ 0 }}, 小数: 0.0, 句柄: 0 }}", 访问),
             C类型::指针 =>
-                format!("运行时值 {{ 标签: 4, 整数: ({} ) as i64, 小数: 0.0, 句柄: 0 }}", 访问),
+                // 指针由整数承载（规范 §6.5.8）；不得标成堆句柄(4)，否则回传 C 时会被当成 0 号堆对象编组。
+                format!("运行时值 {{ 标签: 1, 整数: ({} ) as i64, 小数: 0.0, 句柄: 0 }}", 访问),
             C类型::C字符 =>
                 format!("运行时值 {{ 标签: 1, 整数: ({} ) as i8 as i64, 小数: 0.0, 句柄: 0 }}", 访问),
             C类型::C无符号字符 =>
@@ -929,7 +930,17 @@ impl FFI代码生成器 {
                 let 数组元素码 = f.形参数组元素C类型.get(i).copied().unwrap_or(0);
                 let 表达式 = Self::生成参数读取代码(i, t, 数组元素码);
                 let 变量名 = format!("a{}", i);
-                代码.push_str(&format!("    let {} = {};\n", 变量名, 表达式));
+                if matches!(t, C类型::字符串) && 数组元素码 == 0 {
+                    // 文本形参：局部持有 CString（调用后释放），向 C 传其指针；None → NULL
+                    let 持有名 = format!("s{}", i);
+                    代码.push_str(&format!("    let {}: Option<std::ffi::CString> = {};\n", 持有名, 表达式));
+                    代码.push_str(&format!(
+                        "    let {} = match &{} {{ Some(c) => c.as_ptr() as *const i8, None => std::ptr::null() }};\n",
+                        变量名, 持有名
+                    ));
+                } else {
+                    代码.push_str(&format!("    let {} = {};\n", 变量名, 表达式));
+                }
                 调用实参.push(变量名);
             }
         }
@@ -991,13 +1002,18 @@ impl FFI代码生成器 {
                 // 宿主已把 文本 编组为 标签_外部值 扁平缓冲（[子标签u64][总长u64][UTF-8字节]），
                 // 总长 = 16 + UTF-8字节数。此处从缓冲头读总长，跳过 16 字节头取 payload，
                 // 重建 NUL 结尾的 CString 指针传给 C 侧（C 侧 const char* 需 NUL 结尾）。
+                // 结果是 Option<CString>：由包装函数的局部变量持有，调用返回后自动释放（规范 §6.5.8「调用后释放」）；
+                // 实参不是外部值缓冲（如传入空值）→ None → 传 NULL。内嵌 NUL 时按 C 语义截断到首个 NUL。
                 format!(
                     "{{ let 缓冲 = 参数切片[{}]; \
+                      if 缓冲.标签 != 10 || 缓冲.整数 == 0 {{ None }} else {{ \
                       let 头 = std::slice::from_raw_parts(缓冲.整数 as *const u8, 16); \
                       let 总长 = u64::from_le_bytes([头[8],头[9],头[10],头[11],头[12],头[13],头[14],头[15]]) as usize; \
+                      if 总长 < 16 {{ None }} else {{ \
                       let 字节 = std::slice::from_raw_parts(缓冲.整数 as *const u8, 总长); \
-                      let 文本 = std::str::from_utf8(&字节[16..]).unwrap_or(\"\"); \
-                      std::ffi::CString::new(文本).unwrap_or_default().into_raw() }}",
+                      let 负载 = &字节[16..]; \
+                      let 截止 = 负载.iter().position(|&b| b == 0).unwrap_or(负载.len()); \
+                      std::ffi::CString::new(&负载[..截止]).ok() }} }} }}",
                     索引
                 )
             }
@@ -1104,12 +1120,18 @@ impl FFI代码生成器 {
                 代码.push_str(&format!("    if !输出.is_null() {{ *输出 = 运行时值::逻辑({} != 0); }}\n", 值表达式));
             }
             C类型::指针 => {
-                代码.push_str(&format!("    if !输出.is_null() {{ *输出 = 运行时值 {{ 标签: 4, 整数: {} as i64, 小数: 0.0, 句柄: 0 }}; }}\n", 值表达式));
+                // 指针由整数承载（规范 §6.5.8）：与输出参数分支一致。旧实现标成堆句柄(4)且句柄字段为 0，
+                // 该值再传回 C 时 编组为外部值 会去读 0 号堆对象，C 侧收到无关缓冲或 NULL。
+                代码.push_str(&format!("    if !输出.is_null() {{ *输出 = 运行时值::整数({} as i64); }}\n", 值表达式));
             }
             C类型::字符串 => {
                 // C字符串 → 智语言文本：需拷贝
-                代码.push_str(&format!("    if !输出.is_null() {{\n"));
-                代码.push_str(&format!("        let c_str = std::ffi::CStr::from_ptr({});\n", 值表达式));
+                // C 返回 NULL（getenv 未命中等）→ 空值；对 NULL 调 CStr::from_ptr 是未定义行为。
+                代码.push_str(&format!("    let 文本指针 = {};\n", 值表达式));
+                代码.push_str("    if !输出.is_null() && 文本指针.is_null() {\n");
+                代码.push_str("        *输出 = 运行时值 { 标签: 0, 整数: 0, 小数: 0.0, 句柄: 0 };\n");
+                代码.push_str("    } else if !输出.is_null() {\n");
+                代码.push_str("        let c_str = std::ffi::CStr::from_ptr(文本指针);\n");
                 代码.push_str("        let s = c_str.to_string_lossy().to_string();\n");
                 // ★文本通过外部值传递，缓冲格式与宿主 编组为外部值/释放外部值 严格一致：
                 //   [子标签 u64=4(线_文本)][总长 u64=16+字节数][UTF-8 字节]
