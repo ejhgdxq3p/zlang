@@ -57,7 +57,9 @@ pub struct Http待处理请求 {
 // 供诊断与未来扩展）；显式豁免 dead_code，避免被误判为"死代码"。
 #[allow(dead_code)]
 enum 网络槽位 {
-    Tcp连接 { stream: Arc<Mutex<TcpStream>>, 残余: Arc<Mutex<Vec<u8>>>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
+    // 明文连接读写分锁：`&TcpStream` 本身可并发读写，读方持 残余 锁、写方持 写锁。
+    // 旧实现读写共用一把流锁，一个任务阻塞在读取上时，另一个任务对同一连接的写入会一直卡住。
+    Tcp连接 { stream: Arc<TcpStream>, 写锁: Arc<Mutex<()>>, 残余: Arc<Mutex<Vec<u8>>>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
     Tcp连接TLS { stream: Arc<Mutex<Box<dyn 网络流>>>, 残余: Arc<Mutex<Vec<u8>>>, 底层: Arc<TcpStream>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
     Tcp监听器(Arc<Mutex<TcpListener>>),
     Tcp监听器TLS { config: Arc<ServerConfig>, listener: Arc<Mutex<TcpListener>> },
@@ -224,7 +226,7 @@ impl Read for 带残余读者<'_> {
 }
 
 fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<String>) -> Option<String> {
-    enum 流 { 明文(Arc<Mutex<TcpStream>>), 加密(Arc<Mutex<Box<dyn 网络流>>>) }
+    enum 流 { 明文(Arc<TcpStream>), 加密(Arc<Mutex<Box<dyn 网络流>>>) }
     let 取: Option<(流, Arc<Mutex<Vec<u8>>>)> = {
         let 表 = 网络表.lock().unwrap();
         match 表.读取(资源句柄) {
@@ -242,9 +244,9 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
             操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut **守卫 })
         }
         流::明文(arc) => {
-            let mut 守卫 = arc.lock().unwrap();
             let mut 残 = 残余.lock().unwrap();
-            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut *守卫 })
+            let mut 读端: &TcpStream = &arc;
+            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut 读端 })
         }
     }
 }
@@ -255,11 +257,16 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
         if let 网络槽位::Tcp连接TLS { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
     };
     if let Some(arc) = arc_tls { 操作(&mut *arc.lock().unwrap()); return true; }
-    let arc: Option<Arc<Mutex<TcpStream>>> = {
+    let arc: Option<(Arc<TcpStream>, Arc<Mutex<()>>)> = {
         let 表 = 网络表.lock().unwrap();
-        if let 网络槽位::Tcp连接 { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
+        if let 网络槽位::Tcp连接 { ref stream, ref 写锁, .. } = *表.读取(资源句柄) { Some((stream.clone(), 写锁.clone())) } else { None }
     };
-    if let Some(arc) = arc { 操作(&mut *arc.lock().unwrap()); return true; }
+    if let Some((arc, 写锁)) = arc {
+        let _守卫 = 写锁.lock().unwrap();
+        let mut 写端: &TcpStream = &arc;
+        操作(&mut 写端);
+        return true;
+    }
     false
 }
 
@@ -270,11 +277,11 @@ fn tcp_设置选项(资源句柄: u64, 操作: &dyn Fn(&TcpStream)) {
         if let 网络槽位::Tcp连接TLS { ref 底层, .. } = *表.读取(资源句柄) { Some(底层.clone()) } else { None }
     };
     if let Some(底层) = arc_tls { 操作(&*底层); return; }
-    let arc: Option<Arc<Mutex<TcpStream>>> = {
+    let arc: Option<Arc<TcpStream>> = {
         let 表 = 网络表.lock().unwrap();
         if let 网络槽位::Tcp连接 { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
     };
-    if let Some(arc) = arc { 操作(&*arc.lock().unwrap()); }
+    if let Some(arc) = arc { 操作(&arc); }
 }
 
 // ── 映射条目辅助 ──
@@ -1042,7 +1049,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                     let 本地 = stream.local_addr().unwrap();
                     let 远端 = stream.peer_addr().unwrap();
                     let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接 {
-                        stream: Arc::new(Mutex::new(stream)),
+                        stream: Arc::new(stream), 写锁: Arc::new(Mutex::new(())),
                         残余: Arc::new(Mutex::new(Vec::new())),
                         本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
                         远端地址: 远端.ip().to_string(), 远端端口: 远端.port(),
@@ -1188,6 +1195,9 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
         }
         标准库索引::网络_连接关闭 => { // 连接.关闭()
             let 连接句柄 = 取句柄(参数, 0);
+            // 先断开套接字再释放槽位：别的任务若正阻塞在读写上，手里还握着流的引用，
+            // 只释放槽位不会真正关闭连接，那个任务会一直等下去。
+            tcp_设置选项(读字段资源句柄(连接句柄), &|s| { s.shutdown(std::net::Shutdown::Both).ok(); });
             网络表.lock().unwrap().释放(读字段资源句柄(连接句柄));
             运行时值::空值()
         }
@@ -1268,7 +1278,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                             }
                         }
                         let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接 {
-                            stream: Arc::new(Mutex::new(stream)),
+                            stream: Arc::new(stream), 写锁: Arc::new(Mutex::new(())),
                             残余: Arc::new(Mutex::new(Vec::new())),
                             本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
                             远端地址: peer.ip().to_string(), 远端端口: peer.port(),
@@ -1437,6 +1447,10 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
             let 停止 = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let 完成 = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let 线程标识 = Arc::new(std::sync::OnceLock::new());
+            let 最大请求体: u64 = match 选项.get("最大请求体") {
+                Some(v) => v.parse::<i64>().unwrap_or(64 << 20).max(0) as u64,
+                None => 64 << 20,
+            };
             let 资源 = 网络表.lock().unwrap().分配(网络槽位::网络服务 {
                 端口, 服务: server.clone(), 停止: 停止.clone(), 完成: 完成.clone(), 线程标识: 线程标识.clone(),
             });
@@ -1462,8 +1476,27 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         }
                         let url = req.url().to_string();
                         let 路径 = url.find('?').map(|p| url[..p].to_string()).unwrap_or_else(|| url.clone());
+                        // 请求体上限（选项「最大请求体」，字节，默认 64MB，0 或负数 = 不限）：
+                        // 旧实现无上限整体读入内存，一个超大请求就能把服务进程内存耗尽。
+                        let 超限 = 最大请求体 > 0 && req.body_length().map(|n| n as u64 > 最大请求体).unwrap_or(false);
                         let mut 内容 = String::new();
-                        let _ = req.as_reader().read_to_string(&mut 内容);
+                        let mut 超限 = 超限;
+                        if !超限 {
+                            if 最大请求体 > 0 {
+                                let mut 限读 = req.as_reader().take(最大请求体 + 1);
+                                let mut 字节 = Vec::new();
+                                let _ = 限读.read_to_end(&mut 字节);
+                                if 字节.len() as u64 > 最大请求体 { 超限 = true; }
+                                else if let Ok(文) = String::from_utf8(字节) { 内容 = 文; }
+                            } else {
+                                let _ = req.as_reader().read_to_string(&mut 内容);
+                            }
+                        }
+                        if 超限 {
+                            use crate::tiny_http::{Response, StatusCode};
+                            req.respond(Response::from_string("请求体过大").with_status_code(StatusCode::from(413u16))).ok();
+                            continue;
+                        }
                         // 组装 请求 结构（响应通道字段已删除：统一实现直接 respond，不走队列）
                         // 路径/完整网址 解码：客户端可能发送 percent-encoded 的中文路径（编码网址中文路径），
                         // 此处还原为原始 UTF-8 路径，使 请求.路径() 与源码中写的中文路径一致。
