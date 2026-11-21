@@ -198,6 +198,20 @@ fn 抛网络异常(消息: String) {
     crate::异常运行时::智语言_抛出异常(t.as_ptr(), t.len() as i64, 消息.as_ptr(), 消息.len() as i64);
 }
 
+/// 文本接口的严格解码：字节不是合法 UTF-8 时抛「网络错误」并返回 None。
+/// 旧实现要么把非法字节静默替换成替换字符（数据已损坏却无提示），要么整段丢弃返回空文本。
+fn 严格解码(字节: &[u8], 场景: &str) -> Option<String> {
+    match std::str::from_utf8(字节) {
+        Ok(文) => Some(文.to_string()),
+        Err(e) => {
+            抛网络异常(format!(
+                "{}：收到的数据不是合法的 UTF-8 文本（第 {} 字节起无法解码）；文本接口不能用来收发二进制数据或其它编码的文本",
+                场景, e.valid_up_to() + 1));
+            None
+        }
+    }
+}
+
 // ── 可同时读写的 TLS 连接 ──
 /// rustls 的 `StreamOwned` 读写都要独占整个流，只能用一把锁包住：一个任务阻塞在读取上时，
 /// 别的任务对同一连接的写入会一直卡住。这里把「TLS 状态机」与「套接字」拆开：
@@ -1043,10 +1057,10 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             // EOF：冲刷残余（最后一次可能仍是不完整字节），下一次调用返回空串（EOF 信号）
-                            let 冲 = String::from_utf8_lossy(&残余字节).into_owned();
+                            let 冲 = 严格解码(&残余字节, "流式读取");
                             残余字节.clear();
                             *残余arc.lock().unwrap() = 残余字节;
-                            return 分配文本(冲);
+                            return match 冲 { Some(文) => 分配文本(文), None => 运行时值::空值() };
                         }
                         Ok(n) => {
                             残余字节.extend_from_slice(&buf[..n]);
@@ -1066,6 +1080,14 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                                         *残余arc.lock().unwrap() = 剩余;
                                         return 分配文本(文本);
                                     }
+                                    if e.error_len().is_some() {
+                                        // 开头就是非法字节（不是被块边界切断）：报错。旧实现会一直读到流结束，
+                                        // 把整个响应缓存在内存里再做有损解码。
+                                        残余字节.clear();
+                                        *残余arc.lock().unwrap() = 残余字节;
+                                        严格解码(&[0xFF], "流式读取");
+                                        return 运行时值::空值();
+                                    }
                                     // 整块都是不完整多字节字符前缀 → 继续读
                                 }
                             }
@@ -1077,10 +1099,10 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         }
                         Err(_) => {
                             // 读错误视作连接关闭：冲刷残余
-                            let 冲 = String::from_utf8_lossy(&残余字节).into_owned();
+                            let 冲 = 严格解码(&残余字节, "流式读取");
                             残余字节.clear();
                             *残余arc.lock().unwrap() = 残余字节;
-                            return 分配文本(冲);
+                            return match 冲 { Some(文) => 分配文本(文), None => 运行时值::空值() };
                         }
                     }
                 }
@@ -1167,13 +1189,13 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 let mut 累积: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                        Ok(0) => return 严格解码(&累积, "连接读取"),
                         Ok(n) => {
                             累积.extend_from_slice(&buf[..n]);
                             match std::str::from_utf8(&累积) {
                                 Ok(s) => return Some(s.to_string()),
-                                // 真正非法的字节序列（不是被切断）：保持原有的替换字符语义
-                                Err(e) if e.error_len().is_some() => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                                // 真正非法的字节序列（不是被切断）：报错，不再静默替换
+                                Err(e) if e.error_len().is_some() => return 严格解码(&累积, "连接读取"),
                                 Err(e) => {
                                     let 切 = e.valid_up_to();
                                     if 切 > 0 {
@@ -1189,7 +1211,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                             return None;
                         }
                         Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                        Err(_) => return 严格解码(&累积, "连接读取"),
                     }
                 }
             });
@@ -1215,7 +1237,17 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         Err(_) => break,  // 其它错误视作连接关闭 ⇒ 返回已读取的部分
                     }
                 }
-                Some(String::from_utf8_lossy(&buf[..已读]).to_string())
+                // 读满的 n 字节可能正好切在一个多字节字符中间：把不完整的尾部回退给下一次读，
+                // 只返回完整字符；真正非法的字节序列则报错。
+                match std::str::from_utf8(&buf[..已读]) {
+                    Ok(文) => Some(文.to_string()),
+                    Err(e) if e.error_len().is_none() => {
+                        let 切 = e.valid_up_to();
+                        reader.回退(&buf[切..已读]);
+                        Some(String::from_utf8_lossy(&buf[..切]).into_owned())
+                    }
+                    Err(_) => 严格解码(&buf[..已读], "连接读取指定"),
+                }
             });
             分配文本(result.unwrap_or_default())
         }
@@ -1234,18 +1266,19 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         _ => {}
                     }
                 }
-                Some(String::from_utf8_lossy(&r).to_string())
+                严格解码(&r, "连接读取一行")
             });
             分配文本(result.unwrap_or_default())
         }
         标准库索引::网络_连接读取全部 => { // 连接.读取全部()；超时抛异常
             let 连接句柄 = 取句柄(参数, 0); let 资源句柄 = 读字段资源句柄(连接句柄);
             let result = tcp_读(资源句柄, &|reader| {
-                let mut buf = String::new();
-                match reader.read_to_string(&mut buf) {
-                    Ok(_) => Some(buf),
+                // 按字节读完再解码：read_to_string 遇到非法 UTF-8 会把已读内容整段丢掉，调用方只拿到空文本。
+                let mut buf = Vec::new();
+                match reader.read_to_end(&mut buf) {
+                    Ok(_) => 严格解码(&buf, "连接读取全部"),
                     Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => { 抛网络异常("网络读取超时".into()); None }
-                    Err(_) => Some(buf),
+                    Err(_) => 严格解码(&buf, "连接读取全部"),
                 }
             });
             分配文本(result.unwrap_or_default())
@@ -1441,7 +1474,10 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 let mut buf = [0u8; 65536];
                 match socket.recv_from(&mut buf) {
                     Ok((n, src)) => {
-                        let 数据文本 = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let 数据文本 = match 严格解码(&buf[..n], "数据报接收") {
+                            Some(文) => 文,
+                            None => return 运行时值::空值(),
+                        };
                         分配结构体(数据报消息类型索引, vec![
                             运行时值::句柄(分配文本(数据文本).句柄),
                             运行时值::句柄(分配文本(src.ip().to_string()).句柄),
@@ -1571,16 +1607,23 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         let 超限 = 最大请求体 > 0 && req.body_length().map(|n| n as u64 > 最大请求体).unwrap_or(false);
                         let mut 内容 = String::new();
                         let mut 超限 = 超限;
+                        let mut 非文本 = false;
                         if !超限 {
                             if 最大请求体 > 0 {
                                 let mut 限读 = req.as_reader().take(最大请求体 + 1);
                                 let mut 字节 = Vec::new();
                                 let _ = 限读.read_to_end(&mut 字节);
                                 if 字节.len() as u64 > 最大请求体 { 超限 = true; }
-                                else if let Ok(文) = String::from_utf8(字节) { 内容 = 文; }
-                            } else {
-                                let _ = req.as_reader().read_to_string(&mut 内容);
+                                else { match String::from_utf8(字节) { Ok(文) => 内容 = 文, Err(_) => 非文本 = true } }
+                            } else if req.as_reader().read_to_string(&mut 内容).is_err() {
+                                非文本 = true;
                             }
+                        }
+                        if 非文本 {
+                            // 请求体不是 UTF-8 文本：旧实现静默当成空请求体交给处理器
+                            use crate::tiny_http::{Response, StatusCode};
+                            req.respond(Response::from_string("请求体不是合法的 UTF-8 文本").with_status_code(StatusCode::from(400u16))).ok();
+                            continue;
                         }
                         if 超限 {
                             use crate::tiny_http::{Response, StatusCode};
