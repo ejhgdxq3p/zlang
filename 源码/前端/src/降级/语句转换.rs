@@ -607,7 +607,7 @@ pub(crate) fn 是并发新建返回值(e: &高层表示表达式) -> bool {
         //   泛型限定 `通道<文本>`——`是只读检视系统函数` 曾因全等匹配失效，教训在此复用 ✓）
         _ => return false,
     };
-    (全名.contains("通道") && (全名.ends_with("接收") || 全名.ends_with("尝试接收")))
+    (全名.contains("通道") && (全名.ends_with("接收") || 全名.ends_with("尝试接收") || 全名.ends_with("接收结果")))
         || (全名.contains("任务") && 全名.contains("等待"))
         || 全名.contains("批量等待")
 }

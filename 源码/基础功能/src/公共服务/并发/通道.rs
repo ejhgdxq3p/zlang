@@ -134,6 +134,24 @@ impl 通道 {
         }
     }
 
+    /// 阻塞接收，区分「收到值」与「通道已关闭且已排空」：Ok(值) / Err(())。
+    /// 与 `接收` 的差别只在返回形式——`接收` 把后者折叠成空值，于是「收到空值」与「已关闭」无法区分。
+    pub fn 接收或关闭(&self) -> Result<拥有值, ()> {
+        crossbeam::select! {
+            recv(self.数据接收端) -> 结果 => 结果.map_err(|_| ()),
+            recv(self.关闭信号接收端) -> _ => self.数据接收端.try_recv().map_err(|_| ()),
+        }
+    }
+
+    /// 非阻塞接收三态：Ok(Some(值)) 有值 / Ok(None) 暂时没有数据 / Err(()) 已关闭且已排空。
+    pub fn 尝试接收或关闭(&self) -> Result<Option<拥有值>, ()> {
+        match self.数据接收端.try_recv() {
+            Ok(值) => Ok(Some(值)),
+            Err(crossbeam::channel::TryRecvError::Disconnected) => Err(()),
+            Err(crossbeam::channel::TryRecvError::Empty) => if self.是否关闭() { Err(()) } else { Ok(None) },
+        }
+    }
+
     /// 暴露数据接收端（供多路监听注册通道可读事件）
     pub fn 数据接收端(&self) -> &Receiver<拥有值> {
         &self.数据接收端
