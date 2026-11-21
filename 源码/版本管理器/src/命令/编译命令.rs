@@ -856,6 +856,62 @@ fn 查找外部语言编译器() -> Option<PathBuf> {
     None
 }
 
+/// 运行编译产物，并把它的标准输出/标准错误**边产生边转发**到本进程。
+///
+/// 旧实现用 `.output()`：等子进程结束后才一次性打印，长时间运行的程序（网络服务、带进度输出的
+/// 计算）在运行期间看不到任何输出，被中断时已有输出也全部丢失。
+/// 这里不让子进程直接继承终端，而是读管道后经本进程的 `print!`/`eprint!` 输出——
+/// 与旧实现走同一条输出路径（Windows 控制台下由标准库负责转码，中文不乱码）。
+/// 返回值里的 stdout/stderr 为空（已转发完毕），调用方沿用原有的退出码处理。
+fn 运行并实时转发(程序: &Path) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    fn 转发(mut 源: impl Read, 到标准错误: bool) {
+        let mut 块 = [0u8; 8192];
+        let mut 待解码: Vec<u8> = Vec::new();
+        let 写出 = |文: &str| {
+            if 到标准错误 {
+                eprint!("{}", 文);
+            } else {
+                print!("{}", 文);
+                let _ = std::io::stdout().flush();
+            }
+        };
+        loop {
+            let 读到 = match 源.read(&mut 块) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            待解码.extend_from_slice(&块[..读到]);
+            // 只输出完整的 UTF-8 前缀；被块边界切断的字符留到下一块。真正非法的字节按替换字符输出（与旧行为一致）。
+            let 可输出 = match std::str::from_utf8(&待解码) {
+                Ok(_) => 待解码.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => 待解码.len(),
+            };
+            if 可输出 > 0 {
+                写出(&String::from_utf8_lossy(&待解码[..可输出]));
+                待解码.drain(..可输出);
+            }
+        }
+        if !待解码.is_empty() {
+            写出(&String::from_utf8_lossy(&待解码));
+        }
+    }
+    let mut 子进程 = Command::new(程序)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let 标准输出 = 子进程.stdout.take();
+    let 标准错误 = 子进程.stderr.take();
+    let 错误线程 = std::thread::spawn(move || { if let Some(流) = 标准错误 { 转发(流, true); } });
+    if let Some(流) = 标准输出 { 转发(流, false); }
+    let _ = 错误线程.join();
+    let 状态 = 子进程.wait()?;
+    Ok(std::process::Output { status: 状态, stdout: Vec::new(), stderr: Vec::new() })
+}
+
 /// 剥离外部语言产物路径前缀，返回「外部语言/ 之后」的相对子路径（规范 6.2.4 七）。
 /// 支持三种形态（相对/绝对路径均可，因锁路径经 补全依赖路径 拼成绝对路径）：
 ///   项目根：`外部语言/GTK4/foo.c` 或 `<项目根>/外部语言/GTK4/foo.c` → `GTK4/foo`
@@ -1158,7 +1214,7 @@ fn 执行项目编译(参数: &[String], 运行后执行: bool) {
                     if 输出路径.exists() {
                         eprintln!("[智语言] 项目编译完成：{}/产出/执行文件/", 根路径.display());
                         eprintln!();
-                        match Command::new(&输出路径).stdin(std::process::Stdio::inherit()).output() {
+                        match 运行并实时转发(&输出路径) {
                             Ok(输出) => {
                                 // 🔁 2026-09-25（**修复：非零退出丢弃子进程 stdout**）★
                                 //   **原缺陷**：子进程**非零退出**时只打印 stderr ⇒ **用户程序此前写入 stdout 的输出全部消失** ✗
@@ -1350,7 +1406,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
         if let Ok(上次签名) = fs::read_to_string(&签名文件) {
             if 上次签名.trim() == 完整构建签名 {
                 if 是否运行 && !是库 {
-                    match Command::new(&输出路径).stdin(std::process::Stdio::inherit()).output() {
+                    match 运行并实时转发(&输出路径) {
                         Ok(输出) => {
                             // 🔁 2026-09-25（**同型修复**）：非零退出时也**先转发 stdout**（详见函数内另一处的长注释）★
                             //   原实现只打印 stderr ⇒ 编译模式下「输出后未捕获异常」用例的 stdout 全部丢失 ✗
@@ -1800,7 +1856,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
             }
 
             if 是否运行 && !是库 {
-                match Command::new(&输出路径).stdin(std::process::Stdio::inherit()).output() {
+                match 运行并实时转发(&输出路径) {
                     Ok(输出) => {
                         // 🔁 2026-09-25（**同型修复 · 单文件重建后运行的实际执行点**）★
                         //   原实现在**非零退出**时只打印 stderr ⇒ **子进程 stdout（用户程序的实际输出）被丢弃** ✗
@@ -1827,7 +1883,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "程序".to_string());
                     let exe输出 = 产物目录.join(format!("{}{}", exe名, 可执行后缀));
-                    match Command::new(&exe输出).stdin(std::process::Stdio::inherit()).output() {
+                    match 运行并实时转发(&exe输出) {
                         Ok(输出) => {
                             // 无论退出码先原样转发 stdout（与同函数上方 是库==false 分支一致，修复假双模差异）
                             print!("{}", String::from_utf8_lossy(&输出.stdout));
