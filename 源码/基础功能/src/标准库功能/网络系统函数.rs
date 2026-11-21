@@ -60,7 +60,7 @@ enum 网络槽位 {
     // 明文连接读写分锁：`&TcpStream` 本身可并发读写，读方持 残余 锁、写方持 写锁。
     // 旧实现读写共用一把流锁，一个任务阻塞在读取上时，另一个任务对同一连接的写入会一直卡住。
     Tcp连接 { stream: Arc<TcpStream>, 写锁: Arc<Mutex<()>>, 残余: Arc<Mutex<Vec<u8>>>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
-    Tcp连接TLS { stream: Arc<Mutex<Box<dyn 网络流>>>, 残余: Arc<Mutex<Vec<u8>>>, 底层: Arc<TcpStream>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
+    Tcp连接TLS { stream: Arc<双工TLS>, 残余: Arc<Mutex<Vec<u8>>>, 底层: Arc<TcpStream>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
     Tcp监听器(Arc<Mutex<TcpListener>>),
     Tcp监听器TLS { config: Arc<ServerConfig>, listener: Arc<Mutex<TcpListener>> },
     UdpSocket(Arc<Mutex<UdpSocket>>),
@@ -198,6 +198,92 @@ fn 抛网络异常(消息: String) {
     crate::异常运行时::智语言_抛出异常(t.as_ptr(), t.len() as i64, 消息.as_ptr(), 消息.len() as i64);
 }
 
+// ── 可同时读写的 TLS 连接 ──
+/// rustls 的 `StreamOwned` 读写都要独占整个流，只能用一把锁包住：一个任务阻塞在读取上时，
+/// 别的任务对同一连接的写入会一直卡住。这里把「TLS 状态机」与「套接字」拆开：
+///   · 状态机由一把短锁保护，只在加解密时持有；
+///   · 等待对端数据的阻塞读在**锁外**直接读套接字，读到密文后再持锁喂给状态机。
+/// 约束：同一时刻只有一个读者（由连接的 残余 锁保证），多个写者由 写锁 串行化。
+/// 握手是懒的：首次读或写时在状态机锁内完成（仅握手阶段会持锁做阻塞读写）。
+struct 双工TLS {
+    状态机: Mutex<rustls::Connection>,
+    套接字: Arc<TcpStream>,
+    写锁: Mutex<()>,
+}
+impl 双工TLS {
+    fn 新建(连接: rustls::Connection, 套接字: Arc<TcpStream>) -> Self {
+        双工TLS { 状态机: Mutex::new(连接), 套接字, 写锁: Mutex::new(()) }
+    }
+    fn 锁状态机(&self) -> std::sync::MutexGuard<'_, rustls::Connection> {
+        self.状态机.lock().unwrap_or_else(|毒| 毒.into_inner())
+    }
+    /// 持锁：完成握手，并把状态机里待发的密文（握手消息、告警、应用数据）写到套接字。
+    fn 推进(&self, 连接: &mut rustls::Connection) -> std::io::Result<()> {
+        let mut 口: &TcpStream = &self.套接字;
+        while 连接.is_handshaking() {
+            连接.complete_io(&mut 口)?;
+        }
+        while 连接.wants_write() {
+            连接.write_tls(&mut 口)?;
+        }
+        Ok(())
+    }
+}
+struct TLS读端<'a>(&'a 双工TLS);
+impl Read for TLS读端<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() { return Ok(0); }
+        let mut 密文 = [0u8; 16 * 1024];
+        loop {
+            {
+                let mut 连接 = self.0.锁状态机();
+                self.0.推进(&mut 连接)?;
+                match 连接.reader().read(buf) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // 对端未发 close_notify 就断开：按流结束处理（与明文连接读到 0 一致）
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
+                    Err(e) => return Err(e),
+                }
+            }
+            // 锁外等待对端数据：此时别的任务可以照常写
+            let n = (&*self.0.套接字).read(&mut 密文)?;
+            let mut 连接 = self.0.锁状态机();
+            if n == 0 {
+                // 传输层已结束：告知状态机后由下一轮 reader 给出 0 或错误
+                let mut 空: &[u8] = &[];
+                let _ = 连接.read_tls(&mut 空);
+                let _ = 连接.process_new_packets();
+                return match 连接.reader().read(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Ok(0),
+                };
+            }
+            let mut 待喂: &[u8] = &密文[..n];
+            while !待喂.is_empty() {
+                连接.read_tls(&mut 待喂)?;
+                连接.process_new_packets()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            }
+        }
+    }
+}
+struct TLS写端<'a>(&'a 双工TLS);
+impl Write for TLS写端<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut 连接 = self.0.锁状态机();
+        self.0.推进(&mut 连接)?;
+        let n = 连接.writer().write(buf)?;
+        self.0.推进(&mut 连接)?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut 连接 = self.0.锁状态机();
+        连接.writer().flush()?;
+        self.0.推进(&mut 连接)
+    }
+}
+
 // ── TCP 流读写辅助（统一处理 TcpStream / TLS 流）──
 /// 带「回退缓冲」的读者：`读取` 遇到被数据块边界切断的多字节字符时，把不完整的尾部字节
 /// 回退到连接的残余缓冲，下一次任意读操作（读取/读取指定/读取一行/读取全部）先消费它。
@@ -226,7 +312,7 @@ impl Read for 带残余读者<'_> {
 }
 
 fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<String>) -> Option<String> {
-    enum 流 { 明文(Arc<TcpStream>), 加密(Arc<Mutex<Box<dyn 网络流>>>) }
+    enum 流 { 明文(Arc<TcpStream>), 加密(Arc<双工TLS>) }
     let 取: Option<(流, Arc<Mutex<Vec<u8>>>)> = {
         let 表 = 网络表.lock().unwrap();
         match 表.读取(资源句柄) {
@@ -239,9 +325,9 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
     // 锁顺序固定：先流后残余（残余只在持有流锁期间访问）
     match 流 {
         流::加密(arc) => {
-            let mut 守卫 = arc.lock().unwrap();
             let mut 残 = 残余.lock().unwrap();
-            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut **守卫 })
+            let mut 读端 = TLS读端(&arc);
+            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut 读端 })
         }
         流::明文(arc) => {
             let mut 残 = 残余.lock().unwrap();
@@ -252,11 +338,15 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
 }
 
     fn tcp_写(资源句柄: u64, 操作: &dyn Fn(&mut dyn Write)) -> bool {
-    let arc_tls: Option<Arc<Mutex<Box<dyn 网络流>>>> = {
+    let arc_tls: Option<Arc<双工TLS>> = {
         let 表 = 网络表.lock().unwrap();
         if let 网络槽位::Tcp连接TLS { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
     };
-    if let Some(arc) = arc_tls { 操作(&mut *arc.lock().unwrap()); return true; }
+    if let Some(arc) = arc_tls {
+        let _守卫 = arc.写锁.lock().unwrap_or_else(|毒| 毒.into_inner());
+        操作(&mut TLS写端(&arc));
+        return true;
+    }
     let arc: Option<(Arc<TcpStream>, Arc<Mutex<()>>)> = {
         let 表 = 网络表.lock().unwrap();
         if let 网络槽位::Tcp连接 { ref stream, ref 写锁, .. } = *表.读取(资源句柄) { Some((stream.clone(), 写锁.clone())) } else { None }
@@ -1017,12 +1107,12 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                     Ok(stream) => {
                         match ClientConnection::new(配置, 服务器名) {
                             Ok(conn) => {
-                                let tls = StreamOwned::new(conn, stream);
-                                let 底层 = Arc::new(tls.get_ref().try_clone().unwrap());
+                                let 底层 = Arc::new(stream);
+                                let tls = 双工TLS::新建(conn.into(), 底层.clone());
                                 let 本地 = 底层.local_addr().unwrap();
                                 let 远端 = 底层.peer_addr().unwrap();
                                 let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接TLS {
-                                    stream: Arc::new(Mutex::new(Box::new(tls))),
+                                    stream: Arc::new(tls),
                                     残余: Arc::new(Mutex::new(Vec::new())),
                                     底层,
                                     本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
@@ -1256,11 +1346,11 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                             // TLS 握手
                             match ServerConnection::new(config.clone()) {
                                 Ok(conn) => {
-                                    let tls_stream = StreamOwned::new(conn, stream);
-                                    let 底层 = Arc::new(tls_stream.get_ref().try_clone().unwrap());
+                                    let 底层 = Arc::new(stream);
+                                    let tls_stream = 双工TLS::新建(conn.into(), 底层.clone());
                                     let tls_本地端口 = 底层.local_addr().map(|a| a.port()).unwrap_or(本地.port());
                                     let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接TLS {
-                                        stream: Arc::new(Mutex::new(Box::new(tls_stream))),
+                                        stream: Arc::new(tls_stream),
                                         残余: Arc::new(Mutex::new(Vec::new())),
                                         底层,
                                         本地地址: 本地.ip().to_string(), 本地端口: tls_本地端口,
