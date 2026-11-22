@@ -56,3 +56,10 @@ EXPORT long long square_out(long long *out, long long value) {
     *out = value * value;
     return 0;
 }
+
+/* 回调：在一次调用里把回调依次调用 count 次（实参 1..count），返回各次结果之和。 */
+EXPORT long long call_sum(long long (*f)(long long), long long count) {
+    long long sum = 0;
+    for (long long i = 1; i <= count; i++) sum += f(i);
+    return sum;
+}
