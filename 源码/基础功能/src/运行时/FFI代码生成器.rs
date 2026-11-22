@@ -721,6 +721,9 @@ impl FFI代码生成器 {
                 continue;
             }
             if let C类型::结构体(嵌套名, 嵌套字段) = 字段类型 {
+                // ★总长是「整块长度，含头」：结构体的头是 32 字节（子标签/总长/类型索引/字段数），
+                //   不是文本/数组那样的 16 字节。此处及下方两处返回值分支原先都写成 16 + 字段字节，
+                //   少报 16 字节：宿主按总长校验时判为损坏（整个结构体还原成空值），释放时也按错误的长度归还内存。
                 // 🆕 ① 嵌套结构体字段：递归序列化到 线_结构体 子缓冲，与宿主 从外部值还原 严格对齐。
                 // 子缓冲 = 序列化_嵌套名(值.字段_i as *const 嵌套名_布局)；外层包裹
                 // [子标签=线_结构体(7)][总长][类型索引][字段数] 头（与返回值分支一致）。
@@ -731,7 +734,7 @@ impl FFI代码生成器 {
                     "    {{ let mut 子缓冲 = Vec::new(); 序列化_{}(&值.字段_{}, &mut 子缓冲); \
                      let mut 嵌套缓冲 = Vec::new(); \
                      嵌套缓冲.extend_from_slice(&7u64.to_le_bytes()); \
-                     嵌套缓冲.extend_from_slice(&((16 + 子缓冲.len()) as u64).to_le_bytes()); \
+                     嵌套缓冲.extend_from_slice(&((32 + 子缓冲.len()) as u64).to_le_bytes()); \
                      嵌套缓冲.extend_from_slice(&({}u64).to_le_bytes()); \
                      嵌套缓冲.extend_from_slice(&({}u64).to_le_bytes()); \
                      嵌套缓冲.extend_from_slice(&子缓冲); \
@@ -1091,7 +1094,7 @@ impl FFI代码生成器 {
                 format!(
                     "{{ let mut 扁平缓冲 = Vec::new(); \
                        序列化_{}(&{}, &mut 扁平缓冲); \
-                       let 总长 = (16 + 扁平缓冲.len()) as u64; \
+                       let 总长 = (32 + 扁平缓冲.len()) as u64; \
                        let mut 外部值缓冲 = Vec::new(); \
                        外部值缓冲.extend_from_slice(&7u64.to_le_bytes()); \
                        外部值缓冲.extend_from_slice(&总长.to_le_bytes()); \
@@ -1164,7 +1167,7 @@ impl FFI代码生成器 {
                 代码.push_str(&format!("        let 结构体值 = {};\n", 值表达式));
                 代码.push_str("        let mut 扁平缓冲 = Vec::new();\n");
                 代码.push_str(&format!("        序列化_{}(&结构体值, &mut 扁平缓冲);\n", 名));
-                代码.push_str("        let 总长 = (16 + 扁平缓冲.len()) as u64;\n");
+                代码.push_str("        let 总长 = (32 + 扁平缓冲.len()) as u64;\n");
                 代码.push_str("        let mut 外部值缓冲 = Vec::new();\n");
                 代码.push_str("        外部值缓冲.extend_from_slice(&7u64.to_le_bytes()); // 子标签 = 线_结构体(=7, 与宿主 从外部值还原 对齐)\n");
                 代码.push_str("        外部值缓冲.extend_from_slice(&总长.to_le_bytes());\n");
