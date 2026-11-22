@@ -31,8 +31,6 @@ pub struct 任务句柄内部 {
     完成通知: Condvar,
     // 线程结束标志：任务体（含 catch_unwind 包装）真正执行完毕后置真。
     已结束: Arc<AtomicBool>,
-    /// 结果是否被取走过（等待结果 / 批量等待 成功拿到）。用于进程退出时报告「没人看过的失败」。
-    已取走: AtomicBool,
 }
 
 /// 任务句柄（Clone 仅克隆 Arc，底层共享同一任务）
@@ -51,9 +49,7 @@ impl 任务句柄 {
             完成状态: Mutex::new(None),
             完成通知: Condvar::new(),
             已结束: 已结束.clone(),
-            已取走: AtomicBool::new(false),
         }));
-        登记待核查任务(&句柄.0);
         let 线程侧 = 句柄.clone();
         let 启动结果 = std::thread::Builder::new().spawn(move || {
             let 结果 = catch_unwind(AssertUnwindSafe(闭包));
@@ -102,7 +98,6 @@ impl 任务句柄 {
         let mut 状态 = self.0.完成状态.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = 状态.as_ref() {
-                self.0.已取走.store(true, Ordering::SeqCst);
                 return v.clone();
             }
             状态 = self.0.完成通知.wait(状态).unwrap_or_else(|e| e.into_inner());
@@ -114,7 +109,6 @@ impl 任务句柄 {
         let mut 状态 = self.0.完成状态.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = 状态.as_ref() {
-                self.0.已取走.store(true, Ordering::SeqCst);
                 return Some(v.clone());
             }
             let 现在 = Instant::now();
@@ -162,75 +156,4 @@ impl 任务句柄 {
 /// 用于长计算任务防止饿死其他任务。
 pub fn 任务让出() {
     std::thread::yield_now();
-}
-
-// ── 无人等待的任务失败：进程退出时报告 ──
-// 任务以未捕获异常结束，而程序从未对它调用 等待结果/批量等待 时，这个失败原先完全无声。
-// 这里在进程退出时（atexit，解释与编译两种模式通用）把这类失败逐条写到标准错误，不改变退出码。
-static 待核查任务: Mutex<Vec<std::sync::Weak<任务句柄内部>>> = Mutex::new(Vec::new());
-static 退出钩子已装: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "C" {
-    fn atexit(回调: extern "C" fn()) -> i32;
-}
-
-fn 登记待核查任务(任务: &Arc<任务句柄内部>) {
-    if !退出钩子已装.swap(true, Ordering::SeqCst) {
-        unsafe { atexit(退出时报告任务失败); }
-    }
-    let mut 表 = 待核查任务.lock().unwrap_or_else(|e| e.into_inner());
-    // 表长到 2 的幂时清理一次已无须核查的项（句柄已销毁或结果已被取走），避免长跑服务里无限增长
-    if 表.len() >= 1024 && 表.len().is_power_of_two() {
-        表.retain(|弱| 弱.upgrade().map(|任务| !任务.已取走.load(Ordering::SeqCst)).unwrap_or(false));
-    }
-    表.push(Arc::downgrade(任务));
-}
-
-/// 收集「已结束、结果是异常、且从未被取走」的任务的 (异常类型, 描述)。
-fn 收集无人处理的失败() -> Vec<(String, String)> {
-    // try_lock：退出发生在持锁线程上时宁可不报，也不能卡死退出
-    let 表 = match 待核查任务.try_lock() {
-        Ok(表) => 表,
-        Err(_) => return Vec::new(),
-    };
-    let mut 失败 = Vec::new();
-    for 弱 in 表.iter() {
-        let Some(任务) = 弱.upgrade() else { continue };
-        if 任务.已取走.load(Ordering::SeqCst) { continue; }
-        let Ok(状态) = 任务.完成状态.try_lock() else { continue };
-        if let Some(拥有值::异常(类型, 描述)) = 状态.as_ref() {
-            失败.push((类型.clone(), 描述.clone()));
-        }
-    }
-    失败
-}
-
-extern "C" fn 退出时报告任务失败() {
-    let 失败 = 收集无人处理的失败();
-    const 上限: usize = 10;
-    for (类型, 描述) in 失败.iter().take(上限) {
-        eprintln!("[智语言] 警告：有任务以未捕获异常结束，且结果从未被等待（类型: {}）: {}", 类型, 描述);
-    }
-    if 失败.len() > 上限 {
-        eprintln!("[智语言] 警告：另有 {} 个任务同样失败且无人等待", 失败.len() - 上限);
-    }
-}
-
-#[cfg(test)]
-mod 无人等待失败测试 {
-    use super::*;
-
-    #[test]
-    fn 未等待的失败被收集_等待过的不收集() {
-        let 标记甲 = "无人等待失败测试-甲".to_string();
-        let 标记乙 = "无人等待失败测试-乙".to_string();
-        let (甲, 乙) = (标记甲.clone(), 标记乙.clone());
-        let 没人等 = 任务句柄::启动(move || 拥有值::异常("测试异常".into(), 甲));
-        let 有人等 = 任务句柄::启动(move || 拥有值::异常("测试异常".into(), 乙));
-        let _ = 有人等.等待结果();
-        while !没人等.结果是否就绪() { std::thread::yield_now(); }
-        let 失败 = 收集无人处理的失败();
-        assert!(失败.iter().any(|(_, 描述)| *描述 == 标记甲));
-        assert!(!失败.iter().any(|(_, 描述)| *描述 == 标记乙));
-    }
 }
