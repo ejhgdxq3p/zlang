@@ -374,6 +374,25 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
     false
 }
 
+/// 断开套接字，并让正阻塞在它上面读写的其他线程立刻返回。
+///
+/// Linux/macOS 上 shutdown 就会唤醒阻塞中的 recv（返回 0）。Windows 上 shutdown 不会打断
+/// 另一个线程里已经在等待的 recv，它会一直等到对端发数据或超时（持续集成在 Windows 上
+/// 实测如此）；需要再用 CancelIoEx 取消该套接字上挂起的读写，被取消的调用以错误返回。
+fn 断开并唤醒阻塞方(s: &TcpStream) {
+    s.shutdown(std::net::Shutdown::Both).ok();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CancelIoEx(句柄: *mut std::ffi::c_void, 重叠: *mut std::ffi::c_void) -> i32;
+        }
+        // 第二个参数为空：取消该句柄上所有线程发起的挂起操作。没有挂起操作时返回失败，忽略即可。
+        unsafe { CancelIoEx(s.as_raw_socket() as usize as *mut std::ffi::c_void, std::ptr::null_mut()); }
+    }
+}
+
 fn tcp_设置选项(资源句柄: u64, 操作: &dyn Fn(&TcpStream)) {
     // 对 TLS 连接，通过保留的底层 TcpStream 设置选项（超时等）
     let arc_tls: Option<Arc<TcpStream>> = {
@@ -1320,7 +1339,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
             let 连接句柄 = 取句柄(参数, 0);
             // 先断开套接字再释放槽位：别的任务若正阻塞在读写上，手里还握着流的引用，
             // 只释放槽位不会真正关闭连接，那个任务会一直等下去。
-            tcp_设置选项(读字段资源句柄(连接句柄), &|s| { s.shutdown(std::net::Shutdown::Both).ok(); });
+            tcp_设置选项(读字段资源句柄(连接句柄), &|s| 断开并唤醒阻塞方(s));
             网络表.lock().unwrap().释放(读字段资源句柄(连接句柄));
             运行时值::空值()
         }
