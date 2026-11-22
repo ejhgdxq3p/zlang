@@ -118,6 +118,27 @@ fn 链接外部静态库(
     }
 }
 
+/// FFI：把 shim 目录里的外部动态库登记给链接器（仅 Linux/macOS 需要）。
+///
+/// 编译模式下 shim 是静态库，它对外部 C 符号的引用保持未定义。Windows 上 shim 用 raw-dylib
+/// 自带导入信息；Linux/macOS 没有对应机制，最终链接必须显式带上外部动态库，否则报
+/// 「undefined reference to …」。库文件由 生成并编译shim 复制（非 ASCII 库名另落一份安全名副本）
+/// 到 `<shim根>/外部语言文件/执行文件/`，这里按同一命名规则去找。
+fn 链接外部动态库(链接器实例: &mut 链接器::链接器, shim根: &std::path::Path) {
+    if cfg!(windows) {
+        return;
+    }
+    let 目录 = shim根.join("外部语言文件").join("执行文件");
+    let 后缀 = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    for 库标识 in base::外部调用注册::外部库标识集合() {
+        let 库名 = 库标识.split(['/', '\\']).next_back().unwrap_or(&库标识);
+        let 安全名 = base::FFI代码生成器::FFI代码生成器::链接库安全名(库名);
+        if 目录.join(format!("lib{}.{}", 安全名, 后缀)).exists() {
+            链接器实例.添加动态库(目录.clone(), 安全名);
+        }
+    }
+}
+
 /// 🆕 FFI: 把逻辑库名（如「数据库」代号）解析为真实静态库（.lib/.a，排除 dll 导入库）并部署到
 /// 项目 产出/外部语言文件/编译文件/ 目录。
 /// 扩展名驱动（2026-08-07 定稿）：静态库由路径扩展名（.a/.lib）推导，不再依赖 静态 关键字。
@@ -800,12 +821,14 @@ fn 预扫描入口(_根路径: &Path, 源文件列表: &[String]) -> Vec<(String
 /// 查找用于编译外部语言 C/C++ 源文件的编译器（clang）。
 ///
 /// 中文路径根治铁律（2026-08-05 定稿）：MinGW 的 gcc/ar 是 GNU 第三方程序，
-/// 链老 MSVCRT 把 UTF-8 中文路径按 GBK(936) 解码会乱码「找不到文件」，**绝对禁止调用 gcc/cc**。
+/// 链老 MSVCRT 把 UTF-8 中文路径按 GBK(936) 解码会乱码「找不到文件」，**Windows 上绝对禁止调用 gcc/cc**
+/// （Linux/macOS 没有这个问题，找不到 clang 时退回系统 cc/gcc，见第 4 步）。
 /// 探测顺序：
 ///   1. 开发套件随包自带精简编译器：exe 所在目录的 上级/精简编译器/bin/clang(.exe)（安装环境
 ///      `安装路径/版本X/执行文件/智语言开发套件(.exe)` → `安装路径/版本X/精简编译器/bin/clang(.exe)`）；
 ///   2. 开发仓库工具链：仓库根 文件/外部语言编译器/精简编译器/bin/clang(.exe)（开发环境调试用）；
 ///   3. 用户 PATH 中的 clang（需用户自装 LLVM，UTF-8 原生友好）。
+///   4. 仅非 Windows：PATH 中的 cc、gcc。
 ///   工具链名跨平台由 基础功能::平台 统一提供（POSIX=clang / Windows=clang.exe）。
 /// 任一命中返回其绝对路径；都不存在返回 None（调用方必须明确报错，绝不静默跳过）。
 fn 查找外部语言编译器() -> Option<PathBuf> {
@@ -848,10 +871,21 @@ fn 查找外部语言编译器() -> Option<PathBuf> {
     if 相对候选.exists() {
         return Some(相对候选);
     }
-    // 3. 用户 PATH 中的 clang（不返回 gcc/cc——中文路径必崩）
+    // 3. 用户 PATH 中的 clang（Windows 上不返回 gcc/cc——MinGW 中文路径必崩）
     if Command::new("clang").arg("--version").output()
         .map(|o| o.status.success()).unwrap_or(false) {
         return Some(PathBuf::from("clang"));
+    }
+    // 4. 非 Windows：退回系统 C 编译器 cc / gcc。
+    //    「禁止 gcc/cc」针对的是 Windows 上 MinGW 把 UTF-8 路径按 GBK 解码的问题；
+    //    Linux/macOS 的路径本来就是字节串，系统 cc 处理中文路径没有问题，
+    //    而多数 Linux 发行版默认只装 gcc 不装 clang。
+    #[cfg(not(windows))]
+    for 候选 in ["cc", "gcc"] {
+        if Command::new(候选).arg("--version").output()
+            .map(|o| o.status.success()).unwrap_or(false) {
+            return Some(PathBuf::from(候选));
+        }
     }
     None
 }
@@ -976,7 +1010,7 @@ fn 编译项目外部语言(项目根: &Path) -> Vec<PathBuf> {
                     Err(_) => eprintln!("[智语言] 警告：执行外部语言编译器失败: {}", 编译器.display()),
                 }
             }
-            None => eprintln!("[智语言] 错误：未找到中文路径友好的 C 编译器（clang）。外部语言编译不支持 MinGW gcc（中文路径乱码），需安装开发套件随包工具链或 LLVM。"),
+            None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
         }
     }
 
@@ -1602,7 +1636,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                                             }
                                         }
                                     }
-                                    None => eprintln!("[智语言] 错误：未找到中文路径友好的 C 编译器（clang）。外部语言编译不支持 MinGW gcc（中文路径乱码），需安装开发套件随包工具链或 LLVM。"),
+                                    None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
                                 }
                             } else {
                                 链接器实例.添加目标文件(输出o文件);
@@ -1647,7 +1681,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                         }
                     }
                 }
-                None => eprintln!("[智语言] 错误：未找到中文路径友好的 C 编译器（clang）。外部语言编译不支持 MinGW gcc（中文路径乱码），需安装开发套件随包工具链或 LLVM。"),
+                None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
             }
         }
     }
@@ -1753,6 +1787,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                     // 从 执行文件目录 的 dll 导入库解析 → exe 产生运行时 dll 依赖（中文 dll 名加载失败）。
                     链接外部静态库(&mut 链接器实例, &静态库列表, &静态库搜索目录,
                         执行文件目录.as_deref().unwrap_or(std::path::Path::new("")));
+                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录));
                 }
                 Err(e) => {
                     eprintln!("[智语言] FFI shim 生成失败: {}", e);
@@ -2135,6 +2170,7 @@ fn 编译项目入口(入口文件: &str, 项目根: &Path, 优化级别: 优化
                     链接器实例.添加目标文件(std::path::PathBuf::from(&shim路径));
                     // ★外部 staticlib 一并加入链接（同上：解析 z_shim.lib 中的 UNDEF 外部符号）
                     链接外部静态库(&mut 链接器实例, &静态库列表, &静态库搜索目录, &执行文件目录);
+                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录));
                 }
                 Err(e) => { eprintln!("[智语言] FFI shim 生成失败: {}", e); return false; }
             }

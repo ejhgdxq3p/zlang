@@ -725,6 +725,29 @@ pub fn 处理外部调用(索引: usize, 参数: &[运行时值]) -> 运行时�
             }
         }
         候选路径列表.push(format!("{}{}", 库名, 平台后缀));
+        // POSIX 的 dlopen 对「不含斜杠的名字」只查系统库目录，不查当前目录，
+        // 上面两条「当前目录/库名」的候选在 Linux/macOS 上实际永远落空；且那里的动态库
+        // 习惯带 lib 前缀（libX.so）。这里补上：当前目录的绝对路径、带 lib 前缀的同目录候选。
+        #[cfg(not(windows))]
+        {
+            let mut 目录列表: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(当前exe) = std::env::current_exe() {
+                if let Some(目录) = 当前exe.parent() {
+                    目录列表.push(目录.to_path_buf());
+                }
+            }
+            if let Ok(当前目录) = std::env::current_dir() {
+                目录列表.push(当前目录);
+            }
+            for 目录 in 目录列表 {
+                for 文件名 in [format!("{}{}", 库名, 平台后缀), format!("lib{}{}", 库名, 平台后缀)] {
+                    let 候选 = 目录.join(文件名).to_string_lossy().to_string();
+                    if !候选路径列表.contains(&候选) {
+                        候选路径列表.push(候选);
+                    }
+                }
+            }
+        }
         let 结果 = 候选路径列表.into_iter()
             .find_map(|p| 平台::库::加载(&p));
         库锁.insert(项.库标识.clone(), 结果);
@@ -1462,6 +1485,12 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
     //   静态链接后 shim 仅依赖系统 KERNEL32/ntdll，可在任意路径（含中文路径）下加载。规范 §6.5.3。
     #[cfg(target_env = "msvc")]
     cdylib命令.arg("-C").arg("target-feature=+crt-static");
+    // POSIX：shim 动态依赖的外部库副本就放在 shim 同目录，但加载器默认不查「库自身所在目录」，
+    //   不写 rpath 的话 dlopen(shim) 会因找不到依赖库而失败（表现为「FFI 包装（shim）未加载」）。
+    #[cfg(target_os = "linux")]
+    cdylib命令.arg("-C").arg("link-arg=-Wl,-rpath,$ORIGIN");
+    #[cfg(target_os = "macos")]
+    cdylib命令.arg("-C").arg("link-arg=-Wl,-rpath,@loader_path");
     // 静态链接外部库（真实C ABI）的导入库搜索目录
     // 剔除 Windows verbatim 前缀 \\?\（与 输出目录 一致处理），否则 rustc/链接器对带前缀路径处理异常。
     // ★顺序：输出目录（全局 shim/编译文件，staticlib 部署点）放【最前】，再外部库搜索路径。

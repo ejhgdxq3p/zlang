@@ -25,6 +25,9 @@ pub struct 链接器 {
     pub 导出符号: Vec<String>,
     /// 🆕 FFI: 外部库搜索路径列表（用于链接外部 C 库）
     pub 库路径列表: Vec<PathBuf>,
+    /// FFI：要动态链接的外部库（所在目录, 链接名），仅 Linux/macOS 的 cc 链接路径使用。
+    /// Windows 上 shim 以 raw-dylib 自带导入信息，不需要这一项。
+    pub 动态库列表: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +120,7 @@ impl 链接器 {
         共享模式: false,
         导出符号: vec![],
         库路径列表: vec![],
+        动态库列表: vec![],
     }
     }
 
@@ -141,6 +145,15 @@ impl 链接器 {
     /// 🆕 FFI: 添加外部库搜索路径（用于链接外部 C 库）
     pub fn 添加库路径(&mut self, 路径: PathBuf) {
         self.库路径列表.push(路径);
+    }
+
+    /// FFI：登记一个要动态链接的外部库（Linux/macOS）。
+    /// shim 静态库里对外部 C 符号的引用保持未定义，必须由最终链接把外部动态库带上；
+    /// 同时写入 rpath，使产物运行时能在该目录找到它。
+    pub fn 添加动态库(&mut self, 目录: PathBuf, 链接名: String) {
+        if !self.动态库列表.iter().any(|(d, n)| *d == 目录 && *n == 链接名) {
+            self.动态库列表.push((目录, 链接名));
+        }
     }
 
     /// 自动查找运行时库：依次搜索环境变量、可执行文件同目录、构建目录。
@@ -481,6 +494,19 @@ impl 链接器 {
         // 🆕 FFI: 传递外部库搜索路径
         for 库路径 in &self.库路径列表 {
             cmd.arg("-L").arg(库路径);
+        }
+        // FFI 外部动态库：-L/-l 链接，并写 rpath。库在产物目录之下时用相对产物位置的写法
+        // （$ORIGIN / @loader_path），产出目录整体搬走后仍能运行；否则退回绝对路径。
+        for (目录, 链接名) in &self.动态库列表 {
+            cmd.arg("-L").arg(目录).arg(format!("-l{}", 链接名));
+            let 原点 = if cfg!(target_os = "macos") { "@loader_path" } else { "$ORIGIN" };
+            let 相对 = 输出路径.parent().and_then(|父| 目录.strip_prefix(父).ok());
+            let 运行时路径 = match 相对 {
+                Some(相对) if 相对.as_os_str().is_empty() => 原点.to_string(),
+                Some(相对) => format!("{}/{}", 原点, 相对.to_string_lossy()),
+                None => 目录.to_string_lossy().to_string(),
+            };
+            cmd.arg(format!("-Wl,-rpath,{}", 运行时路径));
         }
         if self.共享模式 {
             cmd.arg("-shared");
