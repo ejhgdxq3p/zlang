@@ -1,0 +1,67 @@
+# 持续集成：在 Linux 与 Windows 上构建整个工作区，跑单元测试和双引擎回归。
+name: 构建与回归
+
+on:
+  push:
+    branches: ["接手修复/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      # Windows 上让 Git Bash 与 python 按 UTF-8 处理中文路径和输出
+      LANG: C.UTF-8
+      PYTHONUTF8: "1"
+    steps:
+      - name: 检出（保留中文文件名）
+        run: git config --global core.quotepath false
+
+      - uses: actions/checkout@v4
+
+      - name: Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: 工具版本
+        run: |
+          for tool in clang cc gcc openssl python3 python; do
+            command -v "$tool" > /dev/null 2>&1 && echo "$tool: $(command -v "$tool")" || echo "$tool: 无"
+          done
+
+      - name: 构建
+        run: cargo build
+
+      - name: 单元测试
+        run: cargo test --workspace --lib --bins
+
+      - name: 双引擎回归
+        run: bash 测试/双引擎回归.sh 产出/双引擎回归 4
+
+      - name: 上传回归日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ matrix.os }}
+          path: 产出/双引擎回归
+          if-no-files-found: ignore
