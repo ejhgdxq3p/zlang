@@ -175,10 +175,108 @@ fn 部署外部静态库(逻辑名: &str, 项目根: &std::path::Path) -> Option
     结果
 }
 
+/// 以 C/C++ 源文件形式声明的外部依赖（规范 §6.2.3「外部单个文件」，锁路径形如
+/// `外部语言/自定义/工具库.c`）：编译并归档成静态库，放到 产出/外部语言文件/编译文件/。
+///
+/// FFI 包装（shim）只能链接「库」。此前工具链只把源文件编成目标文件交给最终链接，
+/// 包装这边按库名去找却什么也找不到，于是解释模式和编译模式都在生成包装时失败。
+/// 归档成静态库之后，它就和用户自己提供的 `.a/.lib` 走同一条已有的静态链接路径。
+///
+/// 库文件按「原始名」命名（包装链接时用的是原始名，代号只是项目内的标识）。
+/// 返回 (库路径, 原始名)；None 表示该库不是源文件形式的依赖，或编译失败（失败原因已打印）。
+fn 构建外部源文件静态库(
+    逻辑名: &str,
+    项目根: &std::path::Path,
+    外部语言产物: &std::path::Path,
+) -> Option<(std::path::PathBuf, String)> {
+    let 方案 = pm::依赖解析::构建模块解析方案(项目根, true).ok()?;
+    let 源文件 = 方案.外部语言映射.iter().find_map(|条目| {
+        if 条目.代号 != 逻辑名 && 条目.原始名 != 逻辑名 {
+            return None;
+        }
+        let 路径 = 条目.路径.as_ref()?;
+        let 扩展 = 路径.extension()?.to_str()?.to_lowercase();
+        (路径.is_file() && matches!(扩展.as_str(), "c" | "cpp" | "cc"))
+            .then(|| (路径.clone(), 条目.原始名.clone()))
+    })?;
+    let (源文件, 逻辑名) = (源文件.0, 源文件.1.as_str());
+    let 库路径 = 外部语言产物.join(format!("{}{}{}", base::平台::库前缀(), 逻辑名, base::平台::库后缀()));
+    // 库比源文件新就复用。
+    let 修改时间 = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).ok();
+    if let (Some(库时间), Some(源时间)) = (修改时间(&库路径), 修改时间(&源文件)) {
+        if 库时间 >= 源时间 {
+            return Some((库路径, 逻辑名.to_string()));
+        }
+    }
+    let Some(编译器) = 查找外部语言编译器() else {
+        eprintln!("[智语言] 错误：外部依赖【{}】是源文件 {}，但未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM）；Linux/macOS 需要 clang、cc 或 gcc 之一。", 逻辑名, 源文件.display());
+        return None;
+    };
+    if fs::create_dir_all(外部语言产物).is_err() {
+        return None;
+    }
+    // 先产出到带进程号的临时文件再改名：同一项目的多个程序可能同时构建同一个库。
+    let 进程号 = std::process::id();
+    let 临时目标文件 = 外部语言产物.join(format!(".{}.{}.o", 逻辑名, 进程号));
+    let 临时库 = 外部语言产物.join(format!(".{}.{}{}", 逻辑名, 进程号, base::平台::库后缀()));
+    eprintln!("[智语言] 编译外部语言源文件: {}", 源文件.display());
+    let mut 命令 = Command::new(&编译器);
+    if 源文件.extension().and_then(|e| e.to_str()).map_or(false, |e| !e.eq_ignore_ascii_case("c")) {
+        命令.arg("-x").arg("c++");
+    }
+    命令.arg("-c").arg("-O2");
+    // 静态库会被链接进包装的动态库，Linux/macOS 上必须是位置无关代码。
+    if !cfg!(windows) {
+        命令.arg("-fPIC");
+    }
+    命令.arg(&源文件).arg("-o").arg(&临时目标文件);
+    match 命令.output() {
+        Ok(输出) if 输出.status.success() => {}
+        Ok(输出) => {
+            eprintln!("[智语言] 错误：外部源文件编译失败 ({}):\n{}", 编译器.display(), String::from_utf8_lossy(&输出.stderr));
+            let _ = fs::remove_file(&临时目标文件);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[智语言] 错误：执行外部语言编译器失败 ({}): {}", 编译器.display(), e);
+            return None;
+        }
+    }
+    let mut 归档器 = 链接器::链接器::新建();
+    归档器.添加目标文件(临时目标文件.clone());
+    归档器.设置输出路径(临时库.clone());
+    let 归档结果 = 归档器.归档静态库();
+    let _ = fs::remove_file(&临时目标文件);
+    if let Err(e) = 归档结果 {
+        eprintln!("[智语言] 错误：外部依赖【{}】归档静态库失败: {}", 逻辑名, e);
+        let _ = fs::remove_file(&临时库);
+        return None;
+    }
+    if fs::rename(&临时库, &库路径).is_err() {
+        let _ = fs::remove_file(&临时库);
+        if !库路径.exists() {
+            return None;
+        }
+    }
+    Some((库路径, 逻辑名.to_string()))
+}
+
 fn 部署外部静态库_扫描(逻辑名: &str, 项目根: &std::path::Path) -> Option<std::path::PathBuf> {
     let 名_lib = format!("{}{}{}", base::平台::库前缀(), 逻辑名, base::平台::库后缀());
     let 输出配置 = pm::产物路径::解析项目输出配置(项目根);
     let 外部语言产物 = 输出配置.外部语言文件.join("编译文件");
+    // 源文件形式的外部依赖：现场编成静态库。它是我们自己产出的，不必经过下面
+    // 「小于 100KB 视为 dll 导入库」的筛选（一个小 C 文件编出来的库远小于这个数）。
+    if let Some((库路径, 原始名)) = 构建外部源文件静态库(逻辑名, 项目根, &外部语言产物) {
+        let 安全名 = base::FFI代码生成器::FFI代码生成器::链接库安全名(&原始名);
+        if 安全名 != 原始名 {
+            let 安全库 = 外部语言产物.join(format!("{}{}{}", base::平台::库前缀(), 安全名, base::平台::库后缀()));
+            if let Err(e) = fs::copy(&库路径, &安全库) {
+                eprintln!("[智语言] 警告：部署外部静态库安全名副本失败 {}: {}", 安全库.display(), e);
+            }
+        }
+        return Some(库路径);
+    }
     let mut 候选源: Vec<std::path::PathBuf> = vec![
         外部语言产物.join(&名_lib),
         项目根.join("外部语言").join(&名_lib),
