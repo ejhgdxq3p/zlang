@@ -187,10 +187,7 @@ fn 部署外部静态库(逻辑名: &str, 项目根: &std::path::Path) -> Option
 
 /// 以 C/C++ 源文件形式声明的外部依赖（规范 §6.2.3「外部单个文件」，锁路径形如
 /// `外部语言/自定义/工具库.c`）：编译并归档成静态库，放到 产出/外部语言文件/编译文件/。
-///
-/// FFI 包装（shim）只能链接「库」。此前工具链只把源文件编成目标文件交给最终链接，
-/// 包装这边按库名去找却什么也找不到，于是解释模式和编译模式都在生成包装时失败。
-/// 归档成静态库之后，它就和用户自己提供的 `.a/.lib` 走同一条已有的静态链接路径。
+/// FFI 包装（shim）只能链接「库」，归档之后它就和用户自己提供的 `.a/.lib` 走同一条静态链接路径。
 ///
 /// 库文件按「原始名」命名（包装链接时用的是原始名，代号只是项目内的标识）。
 /// 返回 (库路径, 原始名)；None 表示该库不是源文件形式的依赖，或编译失败（失败原因已打印）。
@@ -218,10 +215,6 @@ fn 构建外部源文件静态库(
             return Some((库路径, 逻辑名.to_string()));
         }
     }
-    let Some(编译器) = 查找外部语言编译器() else {
-        eprintln!("[智语言] 错误：外部依赖【{}】是源文件 {}，但未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM）；Linux/macOS 需要 clang、cc 或 gcc 之一。", 逻辑名, 源文件.display());
-        return None;
-    };
     if fs::create_dir_all(外部语言产物).is_err() {
         return None;
     }
@@ -230,27 +223,10 @@ fn 构建外部源文件静态库(
     let 临时目标文件 = 外部语言产物.join(format!(".{}.{}.o", 逻辑名, 进程号));
     let 临时库 = 外部语言产物.join(format!(".{}.{}{}", 逻辑名, 进程号, base::平台::库后缀()));
     eprintln!("[智语言] 编译外部语言源文件: {}", 源文件.display());
-    let mut 命令 = Command::new(&编译器);
-    if 源文件.extension().and_then(|e| e.to_str()).map_or(false, |e| !e.eq_ignore_ascii_case("c")) {
-        命令.arg("-x").arg("c++");
-    }
-    命令.arg("-c").arg("-O2");
-    // 静态库会被链接进包装的动态库，Linux/macOS 上必须是位置无关代码。
-    if !cfg!(windows) {
-        命令.arg("-fPIC");
-    }
-    命令.arg(&源文件).arg("-o").arg(&临时目标文件);
-    match 命令.output() {
-        Ok(输出) if 输出.status.success() => {}
-        Ok(输出) => {
-            eprintln!("[智语言] 错误：外部源文件编译失败 ({}):\n{}", 编译器.display(), String::from_utf8_lossy(&输出.stderr));
-            let _ = fs::remove_file(&临时目标文件);
-            return None;
-        }
-        Err(e) => {
-            eprintln!("[智语言] 错误：执行外部语言编译器失败 ({}): {}", 编译器.display(), e);
-            return None;
-        }
+    if let Err(原因) = 编译外部源文件(&源文件, &临时目标文件) {
+        eprintln!("[智语言] 错误：外部依赖【{}】：{}", 逻辑名, 原因);
+        let _ = fs::remove_file(&临时目标文件);
+        return None;
     }
     let mut 归档器 = 链接器::链接器::新建();
     归档器.添加目标文件(临时目标文件.clone());
@@ -347,7 +323,7 @@ fn 部署外部静态库_扫描(逻辑名: &str, 项目根: &std::path::Path) ->
 /// 🆕 2026-08-07 定稿：外部语言是否静态由 项目依赖.配置 锁路径扩展名推导
 /// （取代 静态/原始 关键字）。判据 = 能否部署到外部静态库：
 ///   `.a/.lib`→静态链接；`.dll/.so/.dylib`→动态 dlopen（dll 导入库 <100KB 被排除）；
-///   `.c/.cpp/.cc`→clang 编译 .o（无 .lib 候选，None → 非静态）。
+///   `.c/.cpp/.cc`→现场编译并归档成静态库（见 构建外部源文件静态库）→静态。
 /// 无锁路径时回退默认候选路径（外部语言产物/外部语言目录/全局产出/target 等）。
 /// 编译与运行命令共用此单一真相（双模式 parity）。
 pub(crate) fn 推导外部语言是否静态(库标识: &str, 项目根: &std::path::Path) -> bool {
@@ -926,6 +902,25 @@ fn 预扫描入口(_根路径: &Path, 源文件列表: &[String]) -> Vec<(String
     结果
 }
 
+/// 把一个 C/C++ 源文件编成目标文件。失败原因放在 Err 里，由调用方决定是警告还是中止。
+fn 编译外部源文件(源: &Path, 目标: &Path) -> Result<(), String> {
+    let 编译器 = 查找外部语言编译器().ok_or_else(|| "未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。".to_string())?;
+    let mut 命令 = Command::new(&编译器);
+    if 源.extension().and_then(|e| e.to_str()).map_or(false, |e| !e.eq_ignore_ascii_case("c")) {
+        命令.arg("-x").arg("c++");
+    }
+    命令.arg("-c");
+    // 目标文件可能被归档后链接进 FFI 包装的动态库，Linux/macOS 上必须是位置无关代码。
+    if !cfg!(windows) {
+        命令.arg("-fPIC");
+    }
+    match 命令.arg(源).arg("-o").arg(目标).output() {
+        Ok(输出) if 输出.status.success() => Ok(()),
+        Ok(输出) => Err(format!("外部源文件 {} 编译失败 ({}):\n{}", 源.display(), 编译器.display(), String::from_utf8_lossy(&输出.stderr))),
+        Err(e) => Err(format!("执行外部语言编译器失败 ({}): {}", 编译器.display(), e)),
+    }
+}
+
 /// 查找用于编译外部语言 C/C++ 源文件的编译器（clang）。
 ///
 /// 中文路径根治铁律（2026-08-05 定稿）：MinGW 的 gcc/ar 是 GNU 第三方程序，
@@ -1100,25 +1095,10 @@ fn 编译项目外部语言(项目根: &Path) -> Vec<PathBuf> {
             外部o文件列表.push(输出o文件.to_path_buf());
             return;
         }
-        let 扩展 = 源码.extension().and_then(|e| e.to_str()).unwrap_or("c");
         eprintln!("[智语言] 编译外部语言源文件: {}", 源码.display());
-        match 查找外部语言编译器() {
-            Some(编译器) => {
-                let mut 命令 = Command::new(&编译器);
-                if 扩展 != "c" {
-                    命令.arg("-x").arg("c++");
-                }
-                let 编译结果 = 命令
-                    .args(&["-c", &源码.to_string_lossy(), "-o"])
-                    .arg(&输出o文件).output();
-                match 编译结果 {
-                    Ok(输出) if 输出.status.success() => { 外部o文件列表.push(输出o文件.to_path_buf()); }
-                    Ok(输出) => eprintln!("[智语言] 警告：外部源文件编译失败: {}",
-                        String::from_utf8_lossy(&输出.stderr)),
-                    Err(_) => eprintln!("[智语言] 警告：执行外部语言编译器失败: {}", 编译器.display()),
-                }
-            }
-            None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
+        match 编译外部源文件(源码, 输出o文件) {
+            Ok(()) => 外部o文件列表.push(输出o文件.to_path_buf()),
+            Err(原因) => eprintln!("[智语言] 警告：{}", 原因),
         }
     }
 
@@ -1721,30 +1701,9 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                             // 🆕 G6: 哈希检测替代时间戳
                             if 需要重新编译(&路径, &输出o文件) {
                                 eprintln!("[智语言] 编译外部语言源文件: {}", 路径.display());
-                                match 查找外部语言编译器() {
-                                    Some(编译器) => {
-                                        let mut 命令 = Command::new(&编译器);
-                                        if 扩展 != "c" {
-                                            命令.arg("-x").arg("c++");
-                                        }
-                                        let 编译结果 = 命令
-                                            .args(&["-c", &路径.to_string_lossy(), "-o"])
-                                            .arg(&输出o文件)
-                                            .output();
-                                        match 编译结果 {
-                                            Ok(输出) if 输出.status.success() => {
-                                                链接器实例.添加目标文件(输出o文件);
-                                            }
-                                            Ok(输出) => {
-                                                let stderr = String::from_utf8_lossy(&输出.stderr);
-                                                eprintln!("[智语言] 警告：外部源文件编译失败: {}", stderr);
-                                            }
-                                            Err(_) => {
-                                                eprintln!("[智语言] 警告：执行外部语言编译器失败: {}", 编译器.display());
-                                            }
-                                        }
-                                    }
-                                    None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
+                                match 编译外部源文件(&路径, &输出o文件) {
+                                    Ok(()) => 链接器实例.添加目标文件(输出o文件),
+                                    Err(原因) => eprintln!("[智语言] 警告：{}", 原因),
                                 }
                             } else {
                                 链接器实例.添加目标文件(输出o文件);
@@ -1764,32 +1723,9 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
         if 扩展名 == "c" || 扩展名 == "cpp" || 扩展名 == "cc" {
             let 输出o文件 = 产物目录.join(format!("{}.o", 别名));
             eprintln!("[智语言] 编译外部源文件: {} → {}", 路径, 输出o文件.display());
-            
-            match 查找外部语言编译器() {
-                Some(编译器) => {
-                    let mut 命令 = Command::new(&编译器);
-                    if 扩展名 != "c" {
-                        命令.arg("-x").arg("c++");
-                    }
-                    let 编译结果 = 命令
-                        .args(&["-c", 路径, "-o"])
-                        .arg(&输出o文件)
-                        .output();
-                    match 编译结果 {
-                        Ok(输出) if 输出.status.success() => {
-                            链接器实例.添加目标文件(输出o文件);
-                        }
-                        Ok(输出) => {
-                            let stderr = String::from_utf8_lossy(&输出.stderr);
-                            eprintln!("[智语言] 警告：外部源文件编译失败 ({}): {}", 编译器.display(), stderr);
-                        }
-                        Err(e) => {
-                            eprintln!("[智语言] 警告：执行外部语言编译器失败 ({}): {}", 编译器.display(), e);
-                            eprintln!("[智语言] 提示：请手动编译 '{}' 并将产物放入链接路径", 路径);
-                        }
-                    }
-                }
-                None => eprintln!("[智语言] 错误：未找到可用的 C 编译器。Windows 需要 clang（开发套件随包工具链或自行安装 LLVM；不支持 MinGW gcc，中文路径会乱码）；Linux/macOS 需要 clang、cc 或 gcc 之一。"),
+            match 编译外部源文件(文件路径, &输出o文件) {
+                Ok(()) => 链接器实例.添加目标文件(输出o文件),
+                Err(原因) => eprintln!("[智语言] 警告：{}", 原因),
             }
         }
     }
