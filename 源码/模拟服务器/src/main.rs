@@ -118,7 +118,18 @@ fn 索引路径() -> PathBuf {
     库存储根().join("索引.txt")
 }
 
+/// 索引文件的进程内互斥：「读出 → 修改 → 写回」必须整体串行。
+/// 没有它时，两个并发的发布（单元测试默认多线程并行，正好如此）会各自读到旧索引、
+/// 后写的覆盖先写的，丢掉对方刚登记的版本；读的一方还可能读到写了一半的文件。
+/// 表现为 `上传_带认证_发布成功` 偶发失败（Windows 上尤其容易撞上）。
+static 索引锁: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn 加载索引() -> HashMap<String, Vec<String>> {
+    let _锁 = 索引锁.lock().unwrap_or_else(|e| e.into_inner());
+    加载索引_已加锁()
+}
+
+fn 加载索引_已加锁() -> HashMap<String, Vec<String>> {
     let mut 映射 = HashMap::new();
     if let Ok(内容) = read(索引路径()) {
         let 文本 = String::from_utf8_lossy(&内容);
@@ -145,11 +156,18 @@ fn 保存索引(映射: &HashMap<String, Vec<String>>) {
             }
         }
     }
-    let _ = write(索引路径(), 文本.as_bytes());
+    // 先写临时文件再改名：别的进程读索引时不会看到写了一半的内容。
+    let 目标 = 索引路径();
+    let 临时 = 目标.with_extension(format!("txt.{}.tmp", std::process::id()));
+    if write(&临时, 文本.as_bytes()).is_ok() && std::fs::rename(&临时, &目标).is_err() {
+        let _ = write(&目标, 文本.as_bytes());
+        let _ = std::fs::remove_file(&临时);
+    }
 }
 
 fn 更新发布索引(库名: &str, 版本: &str) {
-    let mut 映射 = 加载索引();
+    let _锁 = 索引锁.lock().unwrap_or_else(|e| e.into_inner());
+    let mut 映射 = 加载索引_已加锁();
     let 列表 = 映射.entry(库名.to_string()).or_insert_with(Vec::new);
     if !列表.contains(&版本.to_string()) {
         列表.push(版本.to_string());
