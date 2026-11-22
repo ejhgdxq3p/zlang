@@ -122,19 +122,29 @@ fn 链接外部静态库(
 ///
 /// 编译模式下 shim 是静态库，它对外部 C 符号的引用保持未定义。Windows 上 shim 用 raw-dylib
 /// 自带导入信息；Linux/macOS 没有对应机制，最终链接必须显式带上外部动态库，否则报
-/// 「undefined reference to …」。库文件由 生成并编译shim 复制（非 ASCII 库名另落一份安全名副本）
-/// 到 `<shim根>/外部语言文件/执行文件/`，这里按同一命名规则去找。
-fn 链接外部动态库(链接器实例: &mut 链接器::链接器, shim根: &std::path::Path) {
-    if cfg!(windows) {
-        return;
-    }
+/// 「undefined reference to …」。库文件由 生成并编译shim 放在 `<shim根>/外部语言文件/执行文件/`
+/// （非 ASCII 库名另有一份安全名副本）。可执行文件按相对自身的位置找库，所以 shim 目录不在
+/// 可执行文件目录之下时（项目构建），把库复制到可执行文件旁边再登记。
+fn 链接外部动态库(链接器实例: &mut 链接器::链接器, shim根: &std::path::Path, 执行文件目录: &std::path::Path) {
+    let 后缀 = match 链接器实例.目标平台 {
+        链接器::目标平台::Windows => return,
+        链接器::目标平台::MacOS => "dylib",
+        链接器::目标平台::Linux => "so",
+    };
     let 目录 = shim根.join("外部语言文件").join("执行文件");
-    let 后缀 = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     for 库标识 in base::外部调用注册::外部库标识集合() {
         let 库名 = 库标识.split(['/', '\\']).next_back().unwrap_or(&库标识);
         let 安全名 = base::FFI代码生成器::FFI代码生成器::链接库安全名(库名);
-        if 目录.join(format!("lib{}.{}", 安全名, 后缀)).exists() {
+        let 文件名 = format!("lib{}.{}", 安全名, 后缀);
+        if !目录.join(&文件名).exists() {
+            continue;
+        }
+        if 目录.starts_with(执行文件目录) {
             链接器实例.添加动态库(目录.clone(), 安全名);
+        } else if std::fs::copy(目录.join(&文件名), 执行文件目录.join(&文件名)).is_ok() {
+            链接器实例.添加动态库(执行文件目录.to_path_buf(), 安全名);
+        } else {
+            eprintln!("[智语言] 警告：复制外部动态库 {} 到可执行文件目录失败", 文件名);
         }
     }
 }
@@ -1885,7 +1895,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
                     // 从 执行文件目录 的 dll 导入库解析 → exe 产生运行时 dll 依赖（中文 dll 名加载失败）。
                     链接外部静态库(&mut 链接器实例, &静态库列表, &静态库搜索目录,
                         执行文件目录.as_deref().unwrap_or(std::path::Path::new("")));
-                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录));
+                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录), &产物目录);
                 }
                 Err(e) => {
                     eprintln!("[智语言] FFI shim 生成失败: {}", e);
@@ -2268,7 +2278,7 @@ fn 编译项目入口(入口文件: &str, 项目根: &Path, 优化级别: 优化
                     链接器实例.添加目标文件(std::path::PathBuf::from(&shim路径));
                     // ★外部 staticlib 一并加入链接（同上：解析 z_shim.lib 中的 UNDEF 外部符号）
                     链接外部静态库(&mut 链接器实例, &静态库列表, &静态库搜索目录, &执行文件目录);
-                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录));
+                    链接外部动态库(&mut 链接器实例, std::path::Path::new(&shim目录), &执行文件目录);
                 }
                 Err(e) => { eprintln!("[智语言] FFI shim 生成失败: {}", e); return false; }
             }

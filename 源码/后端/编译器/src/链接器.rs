@@ -495,16 +495,16 @@ impl 链接器 {
         for 库路径 in &self.库路径列表 {
             cmd.arg("-L").arg(库路径);
         }
-        // FFI 外部动态库：-L/-l 链接，并写 rpath。库在产物目录之下时用相对产物位置的写法
-        // （$ORIGIN / @loader_path），产出目录整体搬走后仍能运行；否则退回绝对路径。
+        // FFI 外部动态库：-L/-l 链接，rpath 写成相对产物自身的位置（$ORIGIN / @loader_path），
+        // 产出目录整体搬走后仍能运行。调用方保证库在产物目录或其子目录里。
+        let 原点 = if matches!(self.目标平台, 目标平台::MacOS) { "@loader_path" } else { "$ORIGIN" };
         for (目录, 链接名) in &self.动态库列表 {
             cmd.arg("-L").arg(目录).arg(format!("-l{}", 链接名));
-            let 原点 = if cfg!(target_os = "macos") { "@loader_path" } else { "$ORIGIN" };
-            let 相对 = 输出路径.parent().and_then(|父| 目录.strip_prefix(父).ok());
+            let 相对 = 输出路径.parent().and_then(|父| 目录.strip_prefix(父).ok())
+                .filter(|相对| !相对.as_os_str().is_empty());
             let 运行时路径 = match 相对 {
-                Some(相对) if 相对.as_os_str().is_empty() => 原点.to_string(),
                 Some(相对) => format!("{}/{}", 原点, 相对.to_string_lossy()),
-                None => 目录.to_string_lossy().to_string(),
+                None => 原点.to_string(),
             };
             cmd.arg(format!("-Wl,-rpath,{}", 运行时路径));
         }
