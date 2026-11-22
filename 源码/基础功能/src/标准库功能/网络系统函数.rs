@@ -213,12 +213,13 @@ fn 严格解码(字节: &[u8], 场景: &str) -> Option<String> {
 }
 
 // ── 可同时读写的 TLS 连接 ──
-/// rustls 的 `StreamOwned` 读写都要独占整个流，只能用一把锁包住：一个任务阻塞在读取上时，
-/// 别的任务对同一连接的写入会一直卡住。这里把「TLS 状态机」与「套接字」拆开：
-///   · 状态机由一把短锁保护，只在加解密时持有；
-///   · 等待对端数据的阻塞读在**锁外**直接读套接字，读到密文后再持锁喂给状态机。
-/// 约束：同一时刻只有一个读者（由连接的 残余 锁保证），多个写者由 写锁 串行化。
-/// 握手是懒的：首次读或写时在状态机锁内完成（仅握手阶段会持锁做阻塞读写）。
+/// rustls 的 `StreamOwned` 读写都要独占整个流。这里把「TLS 状态机」与「套接字」拆开，
+/// 状态机锁只在加解密时持有，阻塞的套接字读写都在状态机锁之外：
+///   · 读方在锁外等对端数据，读到密文后持锁喂给状态机；
+///   · 写方持锁把明文加密成密文取出来，放开锁再写套接字。写套接字时若还占着状态机锁，
+///     对端也在大量写而暂时不读的话，本端读方拿不到锁、不再收数据，两边会互相等死。
+/// 约束：同一时刻只有一个读者（由连接的 残余 锁保证）；写套接字由 写锁 串行化，保证密文按产生顺序发出。
+/// 握手是懒的：首次读或写时在状态机锁内完成（握手阶段还没有应用数据在流动）。
 struct 双工TLS {
     状态机: Mutex<rustls::Connection>,
     套接字: Arc<TcpStream>,
@@ -231,16 +232,28 @@ impl 双工TLS {
     fn 锁状态机(&self) -> std::sync::MutexGuard<'_, rustls::Connection> {
         self.状态机.lock().unwrap_or_else(|毒| 毒.into_inner())
     }
-    /// 持锁：完成握手，并把状态机里待发的密文（握手消息、告警、应用数据）写到套接字。
-    fn 推进(&self, 连接: &mut rustls::Connection) -> std::io::Result<()> {
+    fn 握手(&self, 连接: &mut rustls::Connection) -> std::io::Result<()> {
         let mut 口: &TcpStream = &self.套接字;
         while 连接.is_handshaking() {
             连接.complete_io(&mut 口)?;
         }
-        while 连接.wants_write() {
-            连接.write_tls(&mut 口)?;
-        }
         Ok(())
+    }
+    /// 把状态机里待发的密文写到套接字。调用方须持有 写锁，且不能持有状态机锁。
+    fn 冲刷(&self) -> std::io::Result<()> {
+        loop {
+            let mut 密文 = Vec::new();
+            {
+                let mut 连接 = self.锁状态机();
+                while 连接.wants_write() {
+                    连接.write_tls(&mut 密文)?;
+                }
+            }
+            if 密文.is_empty() {
+                return Ok(());
+            }
+            (&*self.套接字).write_all(&密文)?;
+        }
     }
 }
 struct TLS读端<'a>(&'a 双工TLS);
@@ -249,15 +262,23 @@ impl Read for TLS读端<'_> {
         if buf.is_empty() { return Ok(0); }
         let mut 密文 = [0u8; 16 * 1024];
         loop {
-            {
+            let 有待发 = {
                 let mut 连接 = self.0.锁状态机();
-                self.0.推进(&mut 连接)?;
+                self.0.握手(&mut 连接)?;
                 match 连接.reader().read(buf) {
                     Ok(n) => return Ok(n),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     // 对端未发 close_notify 就断开：按流结束处理（与明文连接读到 0 一致）
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
                     Err(e) => return Err(e),
+                }
+                连接.wants_write()
+            };
+            // 处理收到的数据可能产生要回给对端的消息（密钥更新、告警）。读方不能等写方：
+            // 写锁被占着就留给正在写的那一方，它写完会把状态机里新增的密文一并发出。
+            if 有待发 {
+                if let Ok(_写) = self.0.写锁.try_lock() {
+                    self.0.冲刷()?;
                 }
             }
             // 锁外等待对端数据：此时别的任务可以照常写
@@ -282,19 +303,21 @@ impl Read for TLS读端<'_> {
         }
     }
 }
+/// 使用者须持有 写锁（见 tcp_写）。
 struct TLS写端<'a>(&'a 双工TLS);
 impl Write for TLS写端<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut 连接 = self.0.锁状态机();
-        self.0.推进(&mut 连接)?;
-        let n = 连接.writer().write(buf)?;
-        self.0.推进(&mut 连接)?;
+        let n = {
+            let mut 连接 = self.0.锁状态机();
+            self.0.握手(&mut 连接)?;
+            连接.writer().write(buf)?
+        };
+        self.0.冲刷()?;
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut 连接 = self.0.锁状态机();
-        连接.writer().flush()?;
-        self.0.推进(&mut 连接)
+        self.0.锁状态机().writer().flush()?;
+        self.0.冲刷()
     }
 }
 
@@ -336,22 +359,15 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
         }
     };
     let (流, 残余) = 取?;
-    // 锁顺序固定：先流后残余（残余只在持有流锁期间访问）
+    // 残余锁同时充当「同一时刻只有一个读者」的互斥。
+    let mut 残 = 残余.lock().unwrap_or_else(|毒| 毒.into_inner());
     match 流 {
-        流::加密(arc) => {
-            let mut 残 = 残余.lock().unwrap();
-            let mut 读端 = TLS读端(&arc);
-            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut 读端 })
-        }
-        流::明文(arc) => {
-            let mut 残 = 残余.lock().unwrap();
-            let mut 读端: &TcpStream = &arc;
-            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut 读端 })
-        }
+        流::加密(arc) => 操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut TLS读端(&arc) }),
+        流::明文(arc) => 操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut &*arc }),
     }
 }
 
-    fn tcp_写(资源句柄: u64, 操作: &dyn Fn(&mut dyn Write)) -> bool {
+fn tcp_写(资源句柄: u64, 操作: &dyn Fn(&mut dyn Write)) -> bool {
     let arc_tls: Option<Arc<双工TLS>> = {
         let 表 = 网络表.lock().unwrap();
         if let 网络槽位::Tcp连接TLS { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
@@ -366,9 +382,8 @@ fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<St
         if let 网络槽位::Tcp连接 { ref stream, ref 写锁, .. } = *表.读取(资源句柄) { Some((stream.clone(), 写锁.clone())) } else { None }
     };
     if let Some((arc, 写锁)) = arc {
-        let _守卫 = 写锁.lock().unwrap();
-        let mut 写端: &TcpStream = &arc;
-        操作(&mut 写端);
+        let _守卫 = 写锁.lock().unwrap_or_else(|毒| 毒.into_inner());
+        操作(&mut &*arc);
         return true;
     }
     false
