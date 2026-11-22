@@ -604,6 +604,10 @@ impl 链接器 {
         cmd.arg("/DEFAULTLIB:userenv");
         cmd.arg("/DEFAULTLIB:ws2_32");
         cmd.arg("/DEFAULTLIB:ntdll");
+        // WaitOnAddress / WakeByAddressSingle / WakeByAddressAll：较新的 Rust 标准库用它们实现
+        // 互斥锁、条件变量与通道。缺这一项时，用新版工具链构建的运行时库无法链接
+        // （每个程序都报 undefined symbol: WakeByAddressSingle）。
+        cmd.arg("/DEFAULTLIB:synchronization");
         // TLS（schannel / ureq 默认 TLS 后端）依赖的 Windows 系统库，
         // 缺失会导致「undefined symbol: FreeCredentialsHandle / CryptDecodeObjectEx / NCryptFreeObject」等链接错误
         cmd.arg("/DEFAULTLIB:secur32");
