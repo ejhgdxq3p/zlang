@@ -58,6 +58,9 @@ jobs:
       - name: 双引擎回归
         # 单元测试失败也照常跑回归，两边的结果都要看到
         if: ${{ !cancelled() }}
+        # STRICT_DEPS：缺 C 编译器/openssl/python 或有用例自行跳过时判失败，免得相关用例静默不跑
+        env:
+          STRICT_DEPS: "1"
         run: bash 测试/双引擎回归.sh 产出/双引擎回归 4
 
       - name: 上传回归日志
