@@ -1943,19 +1943,15 @@ mod 编组层测试 {
     fn 实参按声明位置展开_输出参数在中间() {
         // 声明 f(甲, 输出 乙, 丙)：调用方只传 (甲, 丙)
         let 实参 = [运行时值::整数(1), 运行时值::整数(3)];
-        let (展开, 已展开) = 按声明位置展开实参(&实参, &[false, true, false]);
-        assert!(已展开);
+        let 展开 = 按声明位置展开实参(&实参, &[false, true, false]).unwrap();
         assert_eq!(展开.len(), 3);
         assert_eq!(展开[0].整数, 1);
         assert_eq!(展开[1].标签, 运行时值::空值().标签);
         assert_eq!(展开[2].整数, 3);
-        // 无输出参数、或个数对不上：原样返回
-        let (原样, 已展开) = 按声明位置展开实参(&实参, &[false, false]);
-        assert!(!已展开);
-        assert_eq!(原样.len(), 2);
-        let (原样, 已展开) = 按声明位置展开实参(&实参, &[false, true, false, false]);
-        assert!(!已展开);
-        assert_eq!(原样.len(), 2);
+        // 无输出参数：原样返回
+        assert_eq!(按声明位置展开实参(&实参, &[false, false]).unwrap().len(), 2);
+        // 个数对不上：交给调用方报错
+        assert!(按声明位置展开实参(&实参, &[false, true, false, false]).is_none());
     }
 
     #[test]
