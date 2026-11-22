@@ -24,6 +24,7 @@ OUT=${1:-"$ROOT/产出/双引擎回归"}
 JOBS=${2:-6}
 [ -x "$BIN" ] || { echo "未找到 $BIN，请先 cargo build --bin 智语言开发套件"; exit 2; }
 mkdir -p "$OUT/解释" "$OUT/编译"
+OUT=$(cd "$OUT" && pwd)   # 转成绝对路径：下面会切换目录，相对路径会指到别处
 cd "$ROOT/测试/智语言代码项目" || exit 2
 
 # ── 准备用例依赖 ────────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ for LOG in "$OUT/解释"/*.log; do
 done
 
 echo "用例总数：$TOTAL"
+[ "${TOTAL:-0}" -gt 0 ] || { echo "没有跑到任何用例，回归无效"; exit 2; }
 echo "退出码或失败数双模不一致：$(printf '%s' "$MISMATCH" | grep -c .)"
 [ -n "$MISMATCH" ] && printf '%s\n' "$MISMATCH" | sed 's/^/  /'
 KNOWN="$ROOT/测试/已知失败.txt"
