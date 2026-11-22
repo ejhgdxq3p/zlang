@@ -725,10 +725,10 @@ pub fn 处理外部调用(索引: usize, 参数: &[运行时值]) -> 运行时�
             }
         }
         候选路径列表.push(format!("{}{}", 库名, 平台后缀));
-        // POSIX 的 dlopen 对「不含斜杠的名字」只查系统库目录，不查当前目录，
-        // 上面两条「当前目录/库名」的候选在 Linux/macOS 上实际永远落空；且那里的动态库
-        // 习惯带 lib 前缀（libX.so）。这里补上：当前目录的绝对路径、带 lib 前缀的同目录候选。
-        #[cfg(not(windows))]
+        // 上面「当前目录/库名」的候选用的是不带目录的相对名，实际永远落空：
+        // POSIX 的 dlopen 对不含斜杠的名字只查系统库目录；Windows 这边加载时带了
+        // LOAD_LIBRARY_SEARCH_* 标志，相对路径直接报参数错误（os_err=87，持续集成实测）。
+        // 这里补上当前目录的绝对路径，以及带 lib 前缀的候选（Linux/macOS 的动态库习惯叫 libX.so）。
         {
             let mut 目录列表: Vec<std::path::PathBuf> = Vec::new();
             if let Ok(当前exe) = std::env::current_exe() {
