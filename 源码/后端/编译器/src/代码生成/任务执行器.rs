@@ -171,7 +171,9 @@ impl 编译器 {
                 构建器.switch_to_block(检查块们[i]);
                 let 候选值 = 构建器.ins().iconst(types::I64, 候选集[i] as i64);
                 let 命中 = 构建器.ins().icmp(IntCC::Equal, 函数索引, 候选值);
-                构建器.ins().brif(命中, 案例块们[i], &[], 默认块, &[]);
+                // 没命中就接着比下一个候选，全部比完才落到默认块。
+                let 下一块 = 检查块们.get(i + 1).copied().unwrap_or(默认块);
+                构建器.ins().brif(命中, 案例块们[i], &[], 下一块, &[]);
             }
 
             for i in 0..n {
