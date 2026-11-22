@@ -1295,7 +1295,77 @@ fn 文件内容相同(源: &std::path::Path, 目标: &std::path::Path) -> bool {
     }
 }
 
-pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::path::PathBuf]) -> Result<String, String> {
+/// 把库文件复制到目标位置：先写到同目录的临时文件再改名，并保留源文件的修改时间。
+///
+/// 多个进程可能同时往同一个包装目录部署同一份库。直接覆盖写会让别的进程加载到写了一半的
+/// 文件；改名是原子的，已经加载旧文件的进程也不受影响。保留修改时间是为了让
+/// `文件内容相同` 在 POSIX 上也能判定「已是同一份」（那里的复制不带时间戳）。
+/// Windows 上目标正被别的进程加载时改名会失败，此时保留原文件即可。
+fn 原子复制(源: &std::path::Path, 目标: &std::path::Path) -> bool {
+    let 文件名 = 目标.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let 临时 = 目标.with_file_name(format!(".{}.{}.tmp", 文件名, std::process::id()));
+    if std::fs::copy(源, &临时).is_err() {
+        let _ = std::fs::remove_file(&临时);
+        return false;
+    }
+    if let Ok(时间) = std::fs::metadata(源).and_then(|m| m.modified()) {
+        if let Ok(文件) = std::fs::OpenOptions::new().write(true).open(&临时) {
+            let _ = 文件.set_modified(时间);
+        }
+    }
+    if std::fs::rename(&临时, 目标).is_err() {
+        let _ = std::fs::remove_file(&临时);
+        return 目标.exists();
+    }
+    true
+}
+
+/// FNV-1a 64 位摘要（跨进程、跨版本稳定；标准库的默认哈希不保证这一点）。
+fn 稳定摘要(各段: &[&[u8]]) -> u64 {
+    let mut 值: u64 = 0xcbf2_9ce4_8422_2325;
+    for 段 in 各段 {
+        for 字节 in 段.iter().chain([0xffu8].iter()) {
+            值 ^= *字节 as u64;
+            值 = 值.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    值
+}
+
+/// 清掉包装目录里长期没用过的按摘要命名的产物和残留的构建临时目录，避免无限堆积。
+fn 清理过期包装产物(shim目录: &std::path::Path) {
+    let 现在 = std::time::SystemTime::now();
+    let 早于 = |路径: &std::path::Path, 秒: u64| -> bool {
+        std::fs::metadata(路径)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| 现在.duration_since(t).ok())
+            .map_or(false, |d| d.as_secs() > 秒)
+    };
+    let Ok(条目列表) = std::fs::read_dir(shim目录) else { return };
+    for 条目 in 条目列表.flatten() {
+        let 路径 = 条目.path();
+        let 名 = 条目.file_name().to_string_lossy().to_string();
+        if 名.starts_with(".构建_") {
+            if 早于(&路径, 3600) {
+                let _ = std::fs::remove_dir_all(&路径);
+            }
+        } else if (名.starts_with("z_shim_") || 名.starts_with("libz_shim_")) && 早于(&路径, 30 * 86400) {
+            let _ = std::fs::remove_file(&路径);
+        } else if 名.ends_with(".tmp") && 名.starts_with('.') && 早于(&路径, 3600) {
+            let _ = std::fs::remove_file(&路径);
+        }
+    }
+}
+
+/// `需要静态库`：编译模式要把包装链接进可执行文件，传 true；解释模式只加载动态库，传 false
+/// （省掉一次 rustc 调用和一个体积很大的静态库）。不需要时返回空字符串。
+///
+/// 并行安全：包装源码、动态库、静态库都按「包装内容 + 所依赖库文件」的摘要命名，
+/// 在本进程专用的临时目录里编译好再改名到位。不同程序互不覆盖，相同程序得到同一份产物
+/// （已存在则直接复用）。此前产物用固定文件名，两个带「外部:」块的程序同时运行时
+/// 会互相覆盖对方正在加载的动态库，表现为段错误或调用到别人的包装。
+pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::path::PathBuf], 需要静态库: bool) -> Result<String, String> {
     // 剔除 Windows verbatim 前缀 \\?\，否则 rustc/链接器对带前缀路径处理异常
     // （项目模式下 输出目录 常带此前缀，独立文件模式不带；统一剔除保证一致）。
     // 跨平台：收敛进 平台::子进程路径（POSIX 原样返回）。
@@ -1397,7 +1467,7 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
                     if 文件内容相同(&路径, &目标) {
                         continue;
                     }
-                    let _ = std::fs::copy(&路径, &目标);
+                    let _ = 原子复制(&路径, &目标);
                 }
             }
         }
@@ -1436,7 +1506,10 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
                         } else {
                             format!("{}.{}", 安全名, 后缀)
                         };
-                        let _ = std::fs::copy(&源, shim目录.join(&目标名));
+                        let 别名目标 = shim目录.join(&目标名);
+                        if 源 != 别名目标 && !文件内容相同(&源, &别名目标) {
+                            let _ = 原子复制(&源, &别名目标);
+                        }
                         已处理 = true;
                         break;
                     }
@@ -1445,32 +1518,83 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
         }
     }
 
-    let shim路径 = std::path::PathBuf::from(
-        shim目录
-            .join("shim.rs")
-            .to_string_lossy()
-            .replace('\r', "")
-            .replace('\n', ""),
-    );
+    清理过期包装产物(&shim目录);
+
+    // 摘要 = 包装源码 + 它引用的库文件（名字、大小、修改时间）。静态外部库会被打进包装，
+    // 所以库文件变了也必须换一份产物。
+    let 摘要 = {
+        let mut 库特征: Vec<String> = Vec::new();
+        let 关心的名字: std::collections::HashSet<String> = 导入函数列表
+            .iter()
+            .flat_map(|f| {
+                let 库名 = f.库标识.split(['/', '\\']).next_back().unwrap_or(&f.库标识).to_string();
+                let 安全名 = super::FFI代码生成器::FFI代码生成器::链接库安全名(&库名);
+                [format!("lib{}", 库名), format!("lib{}", 安全名), 库名, 安全名]
+            })
+            .collect();
+        if let Ok(条目列表) = std::fs::read_dir(&shim目录) {
+            for 条目 in 条目列表.flatten() {
+                let 路径 = 条目.path();
+                let 主名 = 路径.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if !关心的名字.contains(&主名) {
+                    continue;
+                }
+                if let Ok(信息) = 条目.metadata() {
+                    let 时间 = 信息
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_nanos());
+                    库特征.push(format!("{}|{}|{}", 条目.file_name().to_string_lossy(), 信息.len(), 时间));
+                }
+            }
+        }
+        库特征.sort();
+        let 库特征文本 = 库特征.join("\n");
+        format!("{:016x}", 稳定摘要(&[shim内容.as_bytes(), 库特征文本.as_bytes()]))
+    };
+
+    // 本进程专用的构建目录：rustc 的中间文件和半成品都落在这里，完成后改名到位。
+    let 构建目录 = shim目录.join(format!(".构建_{}_{}", std::process::id(), 摘要));
+    std::fs::create_dir_all(&构建目录).map_err(|e| format!("创建 shim 构建目录失败: {}", e))?;
+    struct 构建目录守卫(std::path::PathBuf);
+    impl Drop for 构建目录守卫 {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _守卫 = 构建目录守卫(构建目录.clone());
+    // 把构建目录里的产物改名到最终位置；别的进程抢先放好了同一份（内容等价）也算成功。
+    let 就位 = |临时: &std::path::Path, 最终: &std::path::Path| -> Result<(), String> {
+        if std::fs::rename(临时, 最终).is_ok() || 最终.exists() {
+            Ok(())
+        } else {
+            Err(format!("无法写入 {}", 最终.display()))
+        }
+    };
+
+    let shim路径 = 构建目录.join(format!("z_shim_{}.rs", 摘要));
     std::fs::write(&shim路径, &shim内容).map_err(|e| format!("写入 shim.rs 失败: {}", e))?;
+    // 留一份源码在包装目录里便于排查（失败不影响功能）。
+    let _ = 原子复制(&shim路径, &shim目录.join(format!("z_shim_{}.rs", 摘要)));
 
     // 4a. 编译 shim.rs 为 cdylib（用于 dlopen 注册包装函数）
     #[cfg(target_os = "windows")]
-    let cdylib输出 = shim目录.join("z_shim_cdylib.dll");
+    let cdylib文件名 = format!("z_shim_cdylib_{}.dll", 摘要);
     #[cfg(target_os = "macos")]
-    let cdylib输出 = shim目录.join("libz_shim_cdylib.dylib");
+    let cdylib文件名 = format!("libz_shim_cdylib_{}.dylib", 摘要);
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let cdylib输出 = shim目录.join("libz_shim_cdylib.so");
-    // 清洗可能的 CR/LF 污染
-    let cdylib输出 = std::path::PathBuf::from(
-        cdylib输出.to_string_lossy().replace('\r', "").replace('\n', ""),
-    );
+    let cdylib文件名 = format!("libz_shim_cdylib_{}.so", 摘要);
+    let cdylib输出 = shim目录.join(&cdylib文件名);
+    let cdylib临时 = 构建目录.join(&cdylib文件名);
 
     // 直接用 rustc（不经 cmd /C，避免 Windows 下 cmd 对含中文/CRLF 路径的解析损坏）
-    let cdylib输出路径 = cdylib输出.to_string_lossy().to_string();
+    let cdylib输出路径 = cdylib临时.to_string_lossy().to_string();
     let shim路径字符串 = shim路径.to_string_lossy().to_string();
     let mut cdylib命令 = std::process::Command::new("rustc");
     cdylib命令.args([
+        "--crate-name",
+        "z_shim",
         "--crate-type",
         "cdylib",
         "--edition",
@@ -1507,13 +1631,16 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
         let 路径字符串 = crate::平台::子进程路径(&路径.to_string_lossy());
         cdylib命令.arg("-L").arg(路径字符串);
     }
-    let cdylib结果 = cdylib命令
-        .output()
-        .map_err(|e| format!("执行 rustc 编译 cdylib 失败: {}", e))?;
+    if !cdylib输出.exists() {
+        let cdylib结果 = cdylib命令
+            .output()
+            .map_err(|e| format!("执行 rustc 编译 cdylib 失败: {}", e))?;
 
-    if !cdylib结果.status.success() {
-        let stderr = String::from_utf8_lossy(&cdylib结果.stderr);
-        return Err(format!("shim cdylib 编译失败: {}", stderr));
+        if !cdylib结果.status.success() {
+            let stderr = String::from_utf8_lossy(&cdylib结果.stderr);
+            return Err(format!("shim cdylib 编译失败: {}", stderr));
+        }
+        就位(&cdylib临时, &cdylib输出)?;
     }
 
     // 4b. dlopen cdylib 并注册回调 trampoline 提供者
@@ -1552,42 +1679,48 @@ pub fn 生成并编译shim(输出目录: &str, 外部库搜索路径: &[std::pat
         }
     }
 
-    // 4c. 编译 shim.rs 为静态库（供链接器使用）
-    #[cfg(target_os = "windows")]
-    let 库路径 = shim目录.join("z_shim.lib");
-    #[cfg(not(target_os = "windows"))]
-    let 库路径 = shim目录.join("libz_shim.a");
-    // 清洗可能的 CR/LF 污染
-    let 库路径 = std::path::PathBuf::from(
-        库路径.to_string_lossy().replace('\r', "").replace('\n', ""),
-    );
-
-    let 库路径字符串 = 库路径.to_string_lossy().to_string();
-    let mut staticlib命令 = std::process::Command::new("rustc");
-    staticlib命令.args([
-        "--crate-type",
-        "staticlib",
-        "--edition",
-        "2021",
-        "-o",
-        &库路径字符串,
-        &shim路径字符串,
-    ]);
-    // 静态链接外部库搜索目录（与 cdylib 编译共享相同 -L 路径）
-    // 【G10】shim 目录同样放最前：非 ASCII 库名的安全名副本落在这里。
-    staticlib命令
-        .arg("-L")
-        .arg(crate::平台::子进程路径(&shim目录.to_string_lossy()));
-    for 路径 in 外部库搜索路径 {
-        staticlib命令.arg("-L").arg(路径);
+    // 4c. 编译 shim.rs 为静态库（供链接器使用；解释模式不需要）
+    if !需要静态库 {
+        return Ok(String::new());
     }
-    staticlib命令.arg("-L").arg(&输出目录);
-    let 输出 = staticlib命令.output()
-        .map_err(|e| format!("执行 rustc 编译 shim 失败: {}", e))?;
+    #[cfg(target_os = "windows")]
+    let 静态库文件名 = format!("z_shim_{}.lib", 摘要);
+    #[cfg(not(target_os = "windows"))]
+    let 静态库文件名 = format!("libz_shim_{}.a", 摘要);
+    let 库路径 = shim目录.join(&静态库文件名);
+    let 库临时 = 构建目录.join(&静态库文件名);
 
-    if !输出.status.success() {
-        let stderr = String::from_utf8_lossy(&输出.stderr);
-        return Err(format!("shim.rs 编译失败: {}", stderr));
+    if !库路径.exists() {
+        let 库路径字符串 = 库临时.to_string_lossy().to_string();
+        let mut staticlib命令 = std::process::Command::new("rustc");
+        staticlib命令.args([
+            "--crate-name",
+            "z_shim",
+            "--crate-type",
+            "staticlib",
+            "--edition",
+            "2021",
+            "-o",
+            &库路径字符串,
+            &shim路径字符串,
+        ]);
+        // 静态链接外部库搜索目录（与 cdylib 编译共享相同 -L 路径）
+        // 【G10】shim 目录同样放最前：非 ASCII 库名的安全名副本落在这里。
+        staticlib命令
+            .arg("-L")
+            .arg(crate::平台::子进程路径(&shim目录.to_string_lossy()));
+        for 路径 in 外部库搜索路径 {
+            staticlib命令.arg("-L").arg(路径);
+        }
+        staticlib命令.arg("-L").arg(&输出目录);
+        let 输出 = staticlib命令.output()
+            .map_err(|e| format!("执行 rustc 编译 shim 失败: {}", e))?;
+
+        if !输出.status.success() {
+            let stderr = String::from_utf8_lossy(&输出.stderr);
+            return Err(format!("shim.rs 编译失败: {}", stderr));
+        }
+        就位(&库临时, &库路径)?;
     }
 
     // 5. 生成 .h 头文件（置于 shim 目录，避免 verbatim 路径下 '..' 失效）

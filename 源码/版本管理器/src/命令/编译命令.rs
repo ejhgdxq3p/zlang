@@ -1778,7 +1778,7 @@ fn 编译单文件到目录(文件路径: &str, 产物目录: &PathBuf, 优化�
         }
         let shim目录 = 产物目录.to_string_lossy().to_string();
         if 存在真实CABI {
-            match base::外部调用注册::生成并编译shim(&shim目录, &静态库搜索目录) {
+            match base::外部调用注册::生成并编译shim(&shim目录, &静态库搜索目录, true) {
                 Ok(shim路径) => {
                     eprintln!("[智语言] FFI shim 已生成: {}", shim路径);
                     链接器实例.添加目标文件(std::path::PathBuf::from(&shim路径));
@@ -2164,7 +2164,7 @@ fn 编译项目入口(入口文件: &str, 项目根: &Path, 优化级别: 优化
         let 编译目录 = 输出配置.源码编译文件;
         let shim目录 = 编译目录.to_string_lossy().to_string();
         if 存在真实CABI {
-            match base::外部调用注册::生成并编译shim(&shim目录, &静态库搜索目录) {
+            match base::外部调用注册::生成并编译shim(&shim目录, &静态库搜索目录, true) {
                 Ok(shim路径) => {
                     eprintln!("[智语言] FFI shim 已生成: {}", shim路径);
                     链接器实例.添加目标文件(std::path::PathBuf::from(&shim路径));

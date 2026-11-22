@@ -75,11 +75,8 @@ export -f run_one; export BIN
 run_all() {
   MODE=$1; DIR=$2
   rm -f "$DIR"/*.log
-  # 含「外部:」块的用例逐个串行跑：FFI 包装（shim）生成在固定目录、固定文件名下
-  # （解释模式是全局目录，编译模式是项目产出目录），多个进程同时生成会互相覆盖，
-  # 表现为段错误或中止。这是工具链现存的限制，不是用例本身的问题。
-  grep -L '^外部:' 源码/*.智 | xargs -P "$JOBS" -I{} bash -c 'run_one "$0" "$1" "$2"' "$MODE" "$DIR" {}
-  grep -l '^外部:' 源码/*.智 | xargs -P 1 -I{} bash -c 'run_one "$0" "$1" "$2"' "$MODE" "$DIR" {}
+  # 含「外部:」块的用例也一起并行跑：FFI 包装按内容摘要命名，多个进程互不覆盖。
+  printf '%s\n' 源码/*.智 | xargs -P "$JOBS" -I{} bash -c 'run_one "$0" "$1" "$2"' "$MODE" "$DIR" {}
   for LOG in "$DIR"/*.log; do
     CODE=$(grep -a '^EXIT=' "$LOG" | tail -1 | cut -d= -f2)
     FAILS=$(grep -a -c '❌' "$LOG")

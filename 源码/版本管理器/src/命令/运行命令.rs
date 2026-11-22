@@ -431,7 +431,7 @@ pub(super) fn 注册外部函数(模块: &底层表示模块, 项目根: &std::p
         // 双嵌套（外部语言文件/执行文件 重复）会导致 LoadLibrary 中文长路径失败（os_err=126）。
         let shim目录 = pm::目录::全局目录().join("产出");
         let shim目录字符串 = shim目录.to_string_lossy().to_string();
-        if let Err(e) = base::外部调用注册::生成并编译shim(&shim目录字符串, &静态库搜索目录) {
+        if let Err(e) = base::外部调用注册::生成并编译shim(&shim目录字符串, &静态库搜索目录, false) {
             eprintln!("[智语言] 警告：FFI shim 生成失败（真实C ABI 不可用）: {}", e);
         } else {
             eprintln!("[智语言] 调试：FFI shim 生成成功");
