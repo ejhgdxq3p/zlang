@@ -206,6 +206,12 @@ impl 编译器 {
         let triple = Triple::host();
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "none").unwrap();
+        // 栈探测：栈帧超过一页的函数，入口处逐页触碰栈。Windows 的栈靠「守护页」逐页提交，
+        // 一步跨过守护页去访问更低的地址会直接触发访问冲突——大函数（一个 启动程序 里上百个
+        // 临时值）一进入就崩溃且没有任何输出（持续集成 windows-latest 实测 32 个用例如此）。
+        // 用内联探测，不依赖外部 __chkstk 符号；Linux/macOS 上同样正确，只是多几条指令。
+        flag_builder.set("enable_probestack", "true").unwrap();
+        flag_builder.set("probestack_strategy", "inline").unwrap();
         // 非 Windows 目标生成位置无关代码：系统 cc 默认产出 PIE，非 PIC 目标文件的绝对重定位
         // 会落进只读代码段（DT_TEXTREL 警告；lld/mold 或 -z text 下直接链接失败）。
         if !cfg!(windows) {
