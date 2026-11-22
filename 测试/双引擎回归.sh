@@ -46,10 +46,12 @@ else
 fi
 if [ ! -s "$FIX/cert.pem" ] || [ ! -s "$FIX/key.pem" ]; then
   if command -v openssl > /dev/null 2>&1; then
-    MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=localhost" \
-      -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
-      -keyout "$FIX/key.pem" -out "$FIX/cert.pem" > /dev/null 2>&1 \
-      || { rm -f "$FIX/cert.pem" "$FIX/key.pem"; echo "提示：测试证书生成失败，TLS 用例会跳过或失败"; }
+    # 证书主题和扩展写进配置文件而不是命令行：Windows 的 Git Bash 会把 /CN=… 这样的参数当路径改写
+    printf '%s\n' '[req]' 'distinguished_name = dn' 'x509_extensions = ext' 'prompt = no' \
+      '[dn]' 'CN = localhost' '[ext]' 'subjectAltName = IP:127.0.0.1,DNS:localhost' > "$FIX/openssl.cnf"
+    (cd "$FIX" && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config openssl.cnf \
+      -keyout key.pem -out cert.pem > openssl.log 2>&1) \
+      || { rm -f "$FIX/cert.pem" "$FIX/key.pem"; echo "提示：测试证书生成失败，TLS 用例会跳过或失败："; tail -5 "$FIX/openssl.log"; }
   else
     echo "提示：没有 openssl，TLS 用例会跳过或失败"
   fi
